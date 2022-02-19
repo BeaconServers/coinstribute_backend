@@ -28,4 +28,4 @@ rust-argon2 = { version = "1" }
 rand = { version = "0.8" }
 serde_derive = { version = "1" }
 serde = { version = "1" }
-
+acceptxmr = { version = "0.10" }

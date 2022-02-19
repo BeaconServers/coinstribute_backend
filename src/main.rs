@@ -1,11 +1,23 @@
+mod auth;
+mod money;
+
+use std::sync::Arc;
+use std::time::Duration;
+
 use argon2::{ThreadMode, Variant, Version};
+use acceptxmr::PaymentGateway;
+
 use serde_derive::{Serialize, Deserialize};
 use sled::Tree;
 
 use rand::prelude::*;
 
+use tokio::runtime::Runtime;
+
 use warp::http::{Response, StatusCode};
 use warp::Filter;
+
+use money::{new_invoice, invoice_status};
 
 const ARGON2_CONFIG: argon2::Config = argon2::Config {
     ad: &[],
@@ -18,6 +30,9 @@ const ARGON2_CONFIG: argon2::Config = argon2::Config {
     variant: Variant::Argon2i,
     version: Version::Version13,
 };
+
+const PRIVATE_VIEW_KEY: &'static str = "ad2093a5705b9f33e6f0f0c1bc1f5f639c756cdfc168c8f2ac6127ccbdab3a03";
+const PUBLIC_SPEND_KEY: &'static str = "7388a06bd5455b793a82b90ae801efb9cc0da7156df8af1d5800e4315cc627b4";
 
 #[derive(Deserialize)]
 pub struct AuthRequest {
@@ -34,8 +49,9 @@ pub struct User {
 
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    let tokio_rt = Arc::new(Runtime::new().unwrap());
+
     let db = sled::Config::default()
         .path("db")
         .mode(sled::Mode::HighThroughput)
@@ -43,9 +59,19 @@ async fn main() {
         .open()
         .expect("Failed to open database");
 
-    let auth_db = db.open_tree(b"auth_db").expect("Failed to open authorization tree");
+    let payment_gateway = Arc::new(PaymentGateway::builder(PRIVATE_VIEW_KEY, PUBLIC_SPEND_KEY)
+        .scan_interval(Duration::from_millis(100))
+        .build());
+
+    let auth_db = db.open_tree(b"auth_db").expect("Failed to open authorization tree, time to panic!");
+
+    let invoice_db = db.open_tree(b"invoice_db").expect("Failed to open invoice tree, time to panic!");
 
     let auth_db = warp::any().map(move || auth_db.clone());
+    let invoice_db = warp::any().map(move || invoice_db.clone());
+
+    let payment_gateway_clone = payment_gateway.clone();
+    let payment_gateway_filter = warp::any().map(move || payment_gateway_clone.clone());
 
     let register = warp::path("signup")
         // 2 KB limit to username + password
@@ -61,18 +87,38 @@ async fn main() {
         .and(auth_db.clone())
         .map(login);
 
+    let new_invoice = warp::path("new_invoice")
+        .and(warp::body::content_length_limit(2048))
+        .and(warp::body::form())
+        .and(invoice_db.clone())
+        .and(auth_db.clone())
+        .and(payment_gateway_filter.clone())
+        .and_then(new_invoice);
+
+    let invoice_status = warp::path("invoice_status")
+        .and(warp::body::content_length_limit(2048))
+        .and(warp::body::form())
+        .and(invoice_db.clone())
+        .and(auth_db.clone())
+        .and(payment_gateway_filter.clone())
+        .and_then(invoice_status);
 
     let post_routes = warp::post()
         .and(
             register
             .or(login)
+            .or(new_invoice)
+            .or(invoice_status)
         );
 
     // All get requests should be compressed
 
-    warp::serve(post_routes)
-        .run(([127, 0, 0, 1], 3030))
-        .await
+
+    let payment_gateway = payment_gateway.clone();
+
+    tokio_rt.spawn(async move { payment_gateway.run().await });
+    tokio_rt.block_on(warp::serve(post_routes).run(([127, 0, 0, 1], 3030)));
+
 }
 
 fn register(user_info: AuthRequest, auth_db: Tree) -> Response<String> {
@@ -152,3 +198,4 @@ fn login(user_info: AuthRequest, auth_db: Tree) -> Response<String> {
     }
 
 }
+
