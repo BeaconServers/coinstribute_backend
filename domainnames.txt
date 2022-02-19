@@ -1,0 +1,4 @@
+coinhaver
+silentgive
+quietgive
+coinstribute
