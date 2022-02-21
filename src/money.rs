@@ -24,10 +24,10 @@ pub(crate) struct ViewInvoiceReq {
 	auth_cookie: String,
 }
 
-pub(crate) async fn new_invoice(invoice_req: InvoiceReq, invoice_db: Tree, auth_db: Tree, gateway: Arc<PaymentGateway>) -> Result<impl Reply, Rejection> {
+pub(crate) async fn new_invoice(invoice_req: InvoiceReq, invoice_db: Tree, auth_db: Tree, auth_cookie_db: Tree, gateway: Arc<PaymentGateway>) -> Result<impl Reply, Rejection> {
 	let invoice_req_username_bytes = invoice_req.username.as_bytes();
 
-	if verify_auth_cookie(invoice_req.auth_cookie, &auth_db) && auth_db.contains_key(invoice_req_username_bytes).unwrap() {
+	if verify_auth_cookie(&invoice_req.username, &invoice_req.auth_cookie, &auth_cookie_db) && auth_db.contains_key(invoice_req_username_bytes).unwrap() {
 		if invoice_db.contains_key(invoice_req_username_bytes).unwrap() {
 			Ok(Response::builder()
 		        .status(StatusCode::PRECONDITION_FAILED)
@@ -82,15 +82,14 @@ pub(crate) async fn new_invoice(invoice_req: InvoiceReq, invoice_db: Tree, auth_
     }
 }
 
-pub(crate) async fn invoice_status(status_req: ViewInvoiceReq, invoice_db: Tree, auth_db: Tree, gateway: Arc<PaymentGateway>) -> Result<impl Reply, Rejection> {
+pub(crate) fn invoice_status(status_req: ViewInvoiceReq, invoice_db: Tree, auth_db: Tree, auth_cookie_db: Tree, gateway: Arc<PaymentGateway>) -> Response<String> {
 	let username_bytes = status_req.username.as_bytes();
 
-	if !auth_db.contains_key(username_bytes).unwrap() || !verify_auth_cookie(status_req.auth_cookie, &auth_db) {
-		return 
-			Ok(Response::builder()
-		        .status(StatusCode::UNAUTHORIZED)
-		        .body("Invalid username or cookie".to_string())
-		        .unwrap());
+	if !auth_db.contains_key(username_bytes).unwrap() || !verify_auth_cookie(&status_req.username, &status_req.auth_cookie, &auth_cookie_db) {
+		return Response::builder()
+	        .status(StatusCode::UNAUTHORIZED)
+	        .body("Invalid username or cookie".to_string())
+	        .unwrap();
 	}
 
 	match invoice_db.get(username_bytes).unwrap() {
@@ -98,16 +97,16 @@ pub(crate) async fn invoice_status(status_req: ViewInvoiceReq, invoice_db: Tree,
 			let invoice_id: InvoiceId = bincode::deserialize(&invoice_id).unwrap();
 			let invoice = gateway.get_invoice(invoice_id).unwrap().unwrap();
 
-			Ok(Response::builder()
+			Response::builder()
 		        .status(StatusCode::OK)
 		        .body(format!("{invoice:?}"))
-		        .unwrap())
+		        .unwrap()
 
 		},
-		None => Ok(Response::builder()
+		None => Response::builder()
 		        .status(StatusCode::OK)
 		        .body("No invoice found for user".to_string())
-		        .unwrap())
+		        .unwrap()
 	}
 
 }

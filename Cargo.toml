@@ -1,5 +1,6 @@
 [package]
 name = "coinstribute"
+authors = ["William Batista <bootlegbilly@protonmail.ch>", "Luke Gaston <lsgaston@myhoosierneighbors.com>"]
 version = "0.1.0"
 edition = "2021"
 
@@ -22,7 +23,7 @@ opt-level = 3
 [dependencies]
 bincode = { version = "1" }
 warp = { version = "0.3", features = ["compression"] }
-sled = { version = "0.34", features = ["compression", "miri_optimizations", "io_uring"] }
+sled = { git = "https://github.com/spacejam/sled", features = ["miri_optimizations", "io_uring"] }
 tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread"] }
 rust-argon2 = { version = "1" }
 rand = { version = "0.8" }
