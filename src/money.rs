@@ -1,112 +1,197 @@
 use crate::auth::verify_auth_cookie;
 
+use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::time::Duration;
 
-use acceptxmr::{InvoiceId, PaymentGateway};
-
-use serde::Deserialize;
+use serde::{Serialize, Deserialize};
 use sled::Tree;
+
+use rayon::prelude::*;
+
+use monero_wallet::{Address, Wallet, Payment, PaymentId};
 
 use warp::{Rejection, Reply};
 use warp::{http::Response, hyper::StatusCode};
 
 #[derive(Deserialize)]
-pub(crate) struct InvoiceReq {
+pub struct AuthorizedReq {
 	username: String,
-	/// The invoice amount in piconeros (10^-12 Monero)
-	deposit_amt: u64,
 	auth_cookie: String,
 }
 
 #[derive(Deserialize)]
-pub(crate) struct ViewInvoiceReq {
+pub(crate) struct AttachXMRAddress {
 	username: String,
 	auth_cookie: String,
+	monero_address: String,
 }
 
-pub(crate) async fn new_invoice(invoice_req: InvoiceReq, invoice_db: Tree, auth_db: Tree, auth_cookie_db: Tree, gateway: Arc<PaymentGateway>) -> Result<impl Reply, Rejection> {
-	let invoice_req_username_bytes = invoice_req.username.as_bytes();
+#[derive(Serialize, Deserialize)]
+pub(crate) struct FinancialInfo {
+	xmr_addr: Option<Address>,
+	// The amount of monero in piconeros
+	payment_id: [u8; 8],
+	transfers_in: Vec<Payment>,
+	transfers_out: Vec<Transfer>,
+}
+
+impl FinancialInfo {
+	pub fn new(current_payment_id: Arc<AtomicU64>) -> Self {
+		Self {
+			xmr_addr: None,
+			payment_id: current_payment_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst).to_be_bytes(),
+			transfers_in: Vec::new(),
+			transfers_out: Vec::new(),
+		}
+	}
+
+	/// Adds all the transfers in and transfers out together
+	fn get_balance(&self) -> u64 {
+		let (transfers_in_total, transfers_out_total): (u64, u64) = rayon::join(
+			|| self.transfers_in.par_iter().map(|p| p.amount).sum(),
+			|| self.transfers_out.par_iter().map(|t| t.amt).sum(),
+
+		);
+
+		transfers_in_total.checked_sub(transfers_out_total).unwrap()
+
+	}
+}
+
+pub(crate) async fn deposit_req(invoice_req: AuthorizedReq, auth_db: Tree, auth_cookie_db: Tree, money_db: Tree, wallet: &Wallet) -> Result<impl Reply, Rejection> {
+	let invoice_req_username_bytes = bincode::serialize(&invoice_req.username).unwrap();
 
 	if verify_auth_cookie(&invoice_req.username, &invoice_req.auth_cookie, &auth_cookie_db) && auth_db.contains_key(invoice_req_username_bytes).unwrap() {
-		if invoice_db.contains_key(invoice_req_username_bytes).unwrap() {
-			Ok(Response::builder()
-		        .status(StatusCode::PRECONDITION_FAILED)
-		        .body("You already have an invoice".to_string())
-		        .unwrap())
+		let username = &invoice_req.username;
 
-		} else {
-			// Invoice amount must be > 0.001 Monero
-			if invoice_req.deposit_amt > 1000000000 {
-				// Require 10 confirmations on the Monero network before accepting deposits
-				const REQ_NUM_OF_CONFIRMATIONS: u64 = 10;
-				// Expires in 35 blocks (about an hour)
-				const BLOCK_EXPIRE_TIME: u64 = 35;
+		let payment_id = {
+			let financial_info_bytes = money_db.get(bincode::serialize(username).unwrap()).unwrap().unwrap();
+			let financial_info: FinancialInfo = bincode::deserialize(&financial_info_bytes).unwrap();
 
-				let username = &invoice_req.username;
+			PaymentId::from_slice(&financial_info.payment_id)
+		};
 
-				let invoice_id = 
-					gateway.new_invoice(
-						invoice_req.deposit_amt, 
-						REQ_NUM_OF_CONFIRMATIONS, 
-						BLOCK_EXPIRE_TIME, 
-						&format!("For deposit on {username} account")
-					).await.unwrap();
+		let addr = wallet.new_integrated_addr(payment_id);
+        let fee = wallet.get_fee().await.unwrap();
 
-				let invoice_id_bin = bincode::serialize(&invoice_id).unwrap();
-
-				invoice_db.insert(invoice_req_username_bytes, invoice_id_bin).unwrap();
-
-				Ok(Response::builder()
-			        .status(StatusCode::OK)
-			        .body("Created invoice".to_string())
-			        .unwrap())
-
-
-			} else {
-				Ok(Response::builder()
-			        .status(StatusCode::PRECONDITION_FAILED)
-			        .body("Invalid invoice! 0.001 Monero or greater required".to_string())
-			        .unwrap())
+		Ok(Response::builder()
+	        .status(StatusCode::OK)
+	        .body(format!("Deposit to {addr} with at least {} Monero", (fee as f64 * 10.0) / 10.0_f64.powi(12) ))
+	        .unwrap())
 			
-
-			}
-			
-		}
-
     } else {
     	Ok(Response::builder()
 	        .status(StatusCode::UNAUTHORIZED)
-	        .body("Bad cookie".to_string())
+	        .body("Invalid username or cookie".to_string())
 	        .unwrap())
 
     }
 }
 
-pub(crate) fn invoice_status(status_req: ViewInvoiceReq, invoice_db: Tree, auth_db: Tree, auth_cookie_db: Tree, gateway: Arc<PaymentGateway>) -> Response<String> {
-	let username_bytes = status_req.username.as_bytes();
+pub async fn get_balance(auth_req: AuthorizedReq, auth_db: Tree, money_db: Tree, auth_cookie_db: Tree) -> Result<impl Reply, Rejection> {
+    let username_bytes = bincode::serialize(&auth_req.username).unwrap();
 
-	if !auth_db.contains_key(username_bytes).unwrap() || !verify_auth_cookie(&status_req.username, &status_req.auth_cookie, &auth_cookie_db) {
-		return Response::builder()
+    if verify_auth_cookie(&auth_req.username, &auth_req.auth_cookie, &auth_cookie_db) && auth_db.contains_key(&username_bytes).unwrap() {
+        let financial_info_bytes = money_db.get(&username_bytes).unwrap().unwrap();
+        let financial_info: FinancialInfo = bincode::deserialize(&financial_info_bytes).unwrap();
+        let balance = financial_info.get_balance() as f64 / 10_u64.pow(12) as f64;
+
+        Ok(Response::builder() 
+            .status(StatusCode::UNAUTHORIZED)
+            .body(balance.to_string())
+            .unwrap())
+
+    } else {
+        Ok(Response::builder() 
+              .status(StatusCode::UNAUTHORIZED)
+              .body("Invalid username or cookie".to_string())
+              .unwrap())
+    }
+}
+
+pub(crate) fn attach_xmr_address(attach_req: AttachXMRAddress, money_db: Tree, auth_db: Tree, auth_cookie_db: Tree) -> Response<String> {
+	let username_bytes = bincode::serialize(&attach_req.username).unwrap();
+
+	if auth_db.contains_key(&username_bytes).unwrap() && verify_auth_cookie(&attach_req.username, &attach_req.auth_cookie, &auth_cookie_db) {
+		let financial_info_bytes = money_db.get(&username_bytes).unwrap().unwrap();
+		let mut financial_info: FinancialInfo = bincode::deserialize(&financial_info_bytes).unwrap();
+
+		let xmr_addr = match Address::from_str(&attach_req.monero_address) {
+			Ok(monero_addr) => monero_addr,
+			Err(_) => return Response::builder()
+		        .status(StatusCode::BAD_REQUEST)
+		        .body("Invalid Monero address".to_string())
+		        .unwrap(),
+		};
+
+		financial_info.xmr_addr = Some(xmr_addr);
+
+		Response::builder()
+	        .status(StatusCode::OK)
+	        .body("Set new address".to_string())
+	        .unwrap()
+
+	} else {
+		Response::builder()
 	        .status(StatusCode::UNAUTHORIZED)
 	        .body("Invalid username or cookie".to_string())
-	        .unwrap();
+	        .unwrap()
+
 	}
+}
 
-	match invoice_db.get(username_bytes).unwrap() {
-		Some(invoice_id) => {
-			let invoice_id: InvoiceId = bincode::deserialize(&invoice_id).unwrap();
-			let invoice = gateway.get_invoice(invoice_id).unwrap().unwrap();
+pub async fn update_acc_balances(money_db: Tree, wallet: &Wallet) {
+	const TIME_BETWEEN_UPDATES: Duration = Duration::from_secs(5);
 
-			Response::builder()
-		        .status(StatusCode::OK)
-		        .body(format!("{invoice:?}"))
-		        .unwrap()
+	loop {
+		let mut batch = sled::Batch::default();
 
-		},
-		None => Response::builder()
-		        .status(StatusCode::OK)
-		        .body("No invoice found for user".to_string())
-		        .unwrap()
+		// Updates the amt of money for all users 
+		for db_entry in money_db.iter() {
+			match &db_entry {
+				// TODO: Just use an Arc to get rid of all the cloning
+				Ok(entry) => {
+					let (username, mut financial_info): (String, FinancialInfo) = (
+						bincode::deserialize(&entry.0).unwrap(), 
+						bincode::deserialize(&entry.1).unwrap(),
+					);
+
+					let payment_id = PaymentId::from_slice(&financial_info.payment_id);
+					let payments = wallet.get_payments(payment_id).await.unwrap();
+
+
+					if payments.len() != financial_info.transfers_in.len() {
+						 financial_info.transfers_in = payments.par_iter().filter_map(|payment| {
+							match payment.unlock_time == 0 {
+								true => Some(payment),
+								false => None,
+							}
+						}).cloned().collect();
+
+						batch.insert(bincode::serialize(&username).unwrap(), bincode::serialize(&financial_info).unwrap());
+
+					}
+
+				},
+				Err(e) => {
+					eprintln!("Error when trying to access money_db: {e:?}");
+				},
+			}
+		}
+
+		// Apply all the transactions at once in one large batch
+		money_db.apply_batch(batch).unwrap();
+
+		tokio::time::sleep(TIME_BETWEEN_UPDATES).await;
 	}
+}
 
+#[derive(Serialize, Deserialize)]
+pub struct Transfer {
+	from: String,
+	block_height: u64,
+	amt: u64,
+	tx_hash: String,
 }

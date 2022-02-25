@@ -1,0 +1,211 @@
+use std::{time::Duration, str::FromStr};
+
+use hex::FromHexError;
+use monero::{util::address::PaymentId, Address};
+use rayon::prelude::*;
+use reqwest::{Client, ClientBuilder, Method};
+use simd_json::ValueAccess;
+use serde::{Serialize, Deserialize};
+
+pub struct WalletRPC {
+	client: Client,
+	wallet_daemon_url: String,
+}
+
+impl WalletRPC {
+	pub(crate) fn new(wallet_daemon_url: String, connection_timeout: Option<Duration>, send_timeout: Option<Duration>) -> Self {
+		Self {
+			client: ClientBuilder::new()
+				.connect_timeout(connection_timeout.unwrap_or(Duration::from_millis(10000)))
+				.timeout(send_timeout.unwrap_or(Duration::from_millis(10000)))
+				.build()
+				.unwrap(),
+			wallet_daemon_url,
+
+		}
+	}
+
+	async fn request(&self, payload: &str) -> Result<simd_json::owned::Value, WalletRPCError> {
+		let req = self.client.request(Method::POST, self.wallet_daemon_url.clone() + "/json_rpc")
+			.body(payload.to_string())
+			.build()?;
+
+		let response = self.client.execute(req).await?;
+		Ok(response.json::<simd_json::owned::Value>().await?)
+
+	}
+
+	/// Returns the wallet balance in piconeros
+	pub async fn get_balance(&self) -> Result<u64, WalletRPCError> {
+		const REQUEST_BODY: &'static str = r#"{"jsonrpc": "2.0","id": "0","method": "get_balance","params":{"account_index":0}}"#;
+
+        let response = self.request(REQUEST_BODY).await?;
+        response["result"]["balance"].as_u64().ok_or(WalletRPCError::MissingData)
+
+	}
+
+	pub async fn get_height(&self) -> Result<u64, WalletRPCError> {
+		const REQUEST_BODY: &'static str = r#"{"jsonrpc":"2.0","id":"0","method":"get_height"}"#;
+
+        let response = self.request(REQUEST_BODY).await?;
+        response["result"]["height"].as_u64().ok_or(WalletRPCError::MissingData)
+
+	}
+
+	pub async fn get_address(&self) -> Result<Address, WalletRPCError> {
+		const REQUEST_BODY: &'static str = r#"{"jsonrpc":"2.0","id":"0","method":"get_address","params":{"account_index":0}}}"#;
+
+        let response = self.request(REQUEST_BODY).await?;
+        let addr_str = response["result"]["address"].as_str().ok_or(WalletRPCError::MissingData)?;
+
+        Ok(Address::from_str(addr_str)?)
+
+	}
+
+	/// Gets all the payments sent to a specific PaymentID (pray for me please)
+	pub async fn get_payments(&self, payment_id: PaymentId) -> Result<Vec<Payment>, WalletRPCError> {
+		let payment_id_hex = {
+			let payment_id_bytes = payment_id.as_bytes();
+			hex::encode(payment_id_bytes)
+
+		};
+
+		let mut req_body = String::from(r#"{"jsonrpc":"2.0","id":"0","method":"get_payments","params":{"payment_id":""#);
+
+		req_body.push_str(&payment_id_hex);
+		req_body.push_str(r#""}}"#);
+
+		let response = self.request(&req_body).await?;
+
+		if let Some(payments_json) = response["result"]["payments"].as_array() {
+			let payments: Result<Vec<Payment>, WalletRPCError> = payments_json.par_iter().map(|payment_json| {
+				Ok(Payment {
+			        payment_id: {
+			        	let payment_id_json = &payment_json["payment_id"];
+
+			        	match payment_id_json.as_str() {
+			        		Some(id_str) => {
+			        			let hex_bytes = match hex::decode(id_str) {
+			        				Ok(b) => b,
+			        				Err(e) => return Err(WalletRPCError::HexError(e)),
+			        			};
+
+			        			if hex_bytes.len() != 8 {
+			        				return Err(WalletRPCError::InvalidPaymentId)
+			        			}
+
+			        			let mut hex_bytes_array: [u8; 8] = [0; 8];
+			        			hex_bytes_array.copy_from_slice(&hex_bytes);
+
+			        			hex_bytes_array
+
+			        		},
+			        		None => return Err(WalletRPCError::MissingData),
+
+			        	}
+
+			        },
+			        tx_hash: match payment_json["tx_hash"].as_str() {
+			        	Some(tx_hash) => tx_hash.to_string(),
+			        	None => return Err(WalletRPCError::MissingData),
+			        },
+			        amount: match payment_json["amount"].as_u64() {
+			        	Some(amount) => amount,
+			        	None => return Err(WalletRPCError::MissingData),
+			        },
+			        block_height: match payment_json["block_height"].as_u64() {
+			        	Some(block_height) => block_height,
+			        	None => return Err(WalletRPCError::MissingData),
+			        },
+			        unlock_time: match payment_json["unlock_time"].as_u64() {
+			        	Some(unlock_height) => unlock_height,
+			        	None => return Err(WalletRPCError::MissingData),
+			        },
+			        subaddr_index_major: match payment_json["subaddr_index"]["major"].as_u64() {
+			        	Some(index_major) => index_major,
+			        	None => return Err(WalletRPCError::MissingData),
+			        },
+			        subaddr_index_minor: match payment_json["subaddr_index"]["minor"].as_u64() {
+			        	Some(index_minor) => index_minor,
+			        	None => return Err(WalletRPCError::MissingData),
+			        },
+			        recv_addr: {
+			        	match payment_json["address"].as_str() {
+			        		Some(addr) => {
+			        			match Address::from_str(addr) {
+			        				Ok(addr) => addr,
+			        				Err(e) =>return Err(WalletRPCError::AddrError(e)),
+			        			}
+
+			        		},
+			        		None => return Err(WalletRPCError::MissingData),
+			        	}
+			        },
+			    })
+			}).collect();
+
+			payments
+
+		} else {
+			Err(WalletRPCError::MissingData)
+
+		}
+
+	}
+
+	pub async fn set_daemon(&self, daemon_url: &str, trusted: bool) -> Result<(), WalletRPCError> {
+		let mut req_body = String::from(r#"{"jsonrpc":"2.0","id":"0","method":"set_daemon","params":{"address":""#);
+		req_body.push_str(daemon_url);
+		req_body.push_str(r#"","trusted":"#);
+		req_body.push_str(&trusted.to_string());
+		req_body.push_str(r#"}}"#);
+
+
+        let response = self.request(&req_body).await?;
+        
+        match response.contains_key("result") {
+        	true => Ok(()),
+        	false => Err(WalletRPCError::InvalidSetDaemonReq),
+        }
+	}
+
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Payment {
+	pub payment_id: [u8; 8],
+	pub tx_hash: String,
+	pub amount: u64,
+	pub block_height: u64,
+	/// Time (in block height) until this payment is safe to spend.
+	pub unlock_time: u64,
+	/// The account index for the subaddress
+	pub subaddr_index_major: u64,
+	/// Index of the subaddress of the account
+	pub subaddr_index_minor: u64,
+	/// Account receiving the payment
+	pub recv_addr: Address,
+}
+
+#[derive(Debug)]
+pub enum WalletRPCError {
+	InvalidPaymentId,
+	InvalidSetDaemonReq,
+	MissingData,
+	AddrError(monero::util::address::Error),
+	HexError(FromHexError),
+	ReqwestError(reqwest::Error),
+
+}
+
+impl From<reqwest::Error> for WalletRPCError {
+    fn from(err: reqwest::Error) -> Self {
+        Self::ReqwestError(err)
+    }
+}
+
+impl From<monero::util::address::Error> for WalletRPCError {
+    fn from(err: monero::util::address::Error) -> Self {
+        Self::AddrError(err)
+    }
+}

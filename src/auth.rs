@@ -1,4 +1,6 @@
-use std::{time::SystemTime};
+use std::time::SystemTime;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use argon2::{ThreadMode, Variant, Version};
 
@@ -8,6 +10,8 @@ use rand::distributions::Alphanumeric;
 use sled::Tree;
 use serde::{Serialize, Deserialize};
 use warp::{http::Response, hyper::StatusCode};
+
+use crate::money::FinancialInfo;
 
 pub(crate) const ARGON2_CONFIG: argon2::Config = argon2::Config {
     ad: &[],
@@ -48,7 +52,6 @@ pub struct AuthCookie {
 
 #[derive(Debug)]
 enum GenAuthCookieErr {
-	UserLoggedIn,
 	UserDoesntExist,
 	DbErr(sled::Error),
 	BincodeErr(bincode::Error)
@@ -69,11 +72,13 @@ impl From<bincode::Error> for GenAuthCookieErr {
     }
 }
 
-pub(crate) fn register(user_info: AuthRequest, auth_db: Tree) -> Response<String> {
+pub(crate) fn register(user_info: AuthRequest, auth_db: Tree, money_db: Tree, current_payment_id: Arc<AtomicU64>) -> Response<String> {
     let username = user_info.username;
     let password = user_info.password;
 
-    let user_exists = auth_db.contains_key(username.as_bytes()).unwrap();
+    let username_bytes = bincode::serialize(&username).unwrap();
+
+    let user_exists = auth_db.contains_key(&username_bytes).unwrap();
 
     match user_exists {
         true => {
@@ -91,7 +96,7 @@ pub(crate) fn register(user_info: AuthRequest, auth_db: Tree) -> Response<String
                 Some(hash) => hash,
                 None => return Response::builder()
                   .status(StatusCode::INTERNAL_SERVER_ERROR)
-                  .body("".to_string())
+                  .body("Internal Server Error".to_string())
                   .unwrap()
 
             };
@@ -104,7 +109,8 @@ pub(crate) fn register(user_info: AuthRequest, auth_db: Tree) -> Response<String
 
             let user_bytes = bincode::serialize(&user).unwrap();
 
-            auth_db.insert(user.username.as_bytes(), user_bytes).unwrap();
+            auth_db.insert(&username_bytes, user_bytes).unwrap();
+            money_db.insert(&username_bytes, bincode::serialize(&FinancialInfo::new(current_payment_id)).unwrap()).unwrap();
 
             Response::builder()
                 .status(StatusCode::OK)
@@ -120,7 +126,7 @@ pub(crate) fn login(user_info: AuthRequest, auth_db: Tree, auth_cookie_db: Tree)
     let username = user_info.username;
     let password = user_info.password;
 
-    match auth_db.get(username.as_bytes()).unwrap() {
+    match auth_db.get(bincode::serialize(&username).unwrap()).unwrap() {
         Some(user_info_bytes) => {
             let user_info: User = bincode::deserialize(&user_info_bytes).unwrap();
 
@@ -148,43 +154,37 @@ pub(crate) fn login(user_info: AuthRequest, auth_db: Tree, auth_cookie_db: Tree)
 }
 
 fn generate_auth_cookie(username: &str, auth_db: &Tree, auth_cookie_db: Tree) -> Result<AuthCookie, GenAuthCookieErr> {
-	let username_bytes = username.as_bytes();
+	let username_bytes = bincode::serialize(username).unwrap();
 
-	if auth_cookie_db.contains_key(username_bytes)? {
-		Err(GenAuthCookieErr::UserLoggedIn)
+	if !auth_db.contains_key(&username_bytes)? {
+		// This is a very bad error
+		Err(GenAuthCookieErr::UserDoesntExist)
 
 	} else {
-		if !auth_db.contains_key(username_bytes)? {
-			// This is a very bad error
-			Err(GenAuthCookieErr::UserDoesntExist)
-
-		} else {
-			let cookie: String = thread_rng()
-		        .sample_iter(&Alphanumeric)
-		        .take(50)
-		        .map(char::from)
-		        .collect();
+		let cookie: String = thread_rng()
+	        .sample_iter(&Alphanumeric)
+	        .take(50)
+	        .map(char::from)
+	        .collect();
 
 
-		    const NINETY_DAYS_AS_SECS: u64 = 7776000;
-		    // Calling unwrap here since if SystemTime > UNIX_EPOCH, we have wayyyy bigger problems
-		    let creation_time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+	    const NINETY_DAYS_AS_SECS: u64 = 7776000;
+	    // Calling unwrap here since if SystemTime > UNIX_EPOCH, we have wayyyy bigger problems
+	    let creation_time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
 
-		    let auth_cookie = AuthCookie {
-		        username: username.to_string(),
-		        cookie: cookie,
-		        // The time in Unix time
-		        creation_time,
-		        // In case it isn't obvious, the auth cookie expires in 90 days
-		        expiration_time: creation_time + NINETY_DAYS_AS_SECS,
-		    };
+	    let auth_cookie = AuthCookie {
+	        username: username.to_string(),
+	        cookie,
+	        // The time in Unix time
+	        creation_time,
+	        // In case it isn't obvious, the auth cookie expires in 90 days
+	        expiration_time: creation_time + NINETY_DAYS_AS_SECS,
+	    };
 
-		    let auth_cookie_bytes = bincode::serialize(&auth_cookie)?;
-		    auth_cookie_db.insert(username_bytes, auth_cookie_bytes)?;
+	    let auth_cookie_bytes = bincode::serialize(&auth_cookie)?;
+	    auth_cookie_db.insert(&username_bytes, auth_cookie_bytes)?;
 
-		    Ok(auth_cookie)
-
-		}
+	    Ok(auth_cookie)
 
 	}
 
@@ -194,7 +194,6 @@ fn auth_cookie_result_to_response(auth_cookie: &Result<AuthCookie, GenAuthCookie
 	Response::builder()
 		.status(match auth_cookie.as_ref().err() {
 			Some(err) => match err {
-				GenAuthCookieErr::UserLoggedIn => StatusCode::UNAUTHORIZED,
 				GenAuthCookieErr::UserDoesntExist => StatusCode::UNAUTHORIZED,
 				GenAuthCookieErr::DbErr(_) => StatusCode::INTERNAL_SERVER_ERROR,
 				GenAuthCookieErr::BincodeErr(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -251,7 +250,7 @@ pub(crate) fn destroy_expired_auth_cookies(auth_cookie_db: Tree) {
 }
 
 pub(crate) fn verify_auth_cookie(username: &str, cookie: &str, auth_cookie_db: &Tree) -> bool {
-	let username_bytes = username.as_bytes();
+	let username_bytes = bincode::serialize(username).unwrap();
 
 	match auth_cookie_db.get(username_bytes).unwrap() {
 		Some(auth_cookie_bytes) => {

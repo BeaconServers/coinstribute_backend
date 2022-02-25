@@ -1,19 +1,17 @@
 mod auth;
 mod money;
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, atomic::AtomicU64};
 
-use acceptxmr::PaymentGateway;
+use monero_wallet::Wallet;
+use once_cell::sync::OnceCell;
 use tokio::runtime::Runtime;
 use warp::Filter;
 
 use auth::*;
 use money::*;
 
-const PRIVATE_VIEW_KEY: &'static str = "5cbf005b48eb14e0fe6cbe9337cd29570c60651200336cc6f3982cfba2dbe40c";
-const PUBLIC_SPEND_KEY: &'static str = "c1cc28cd4703b969478438332f890f559331bfedaf2ccc53258df2ca7c9ed269";
-
+static WALLET: OnceCell<Wallet> = OnceCell::new();
 
 fn main() {
     let tokio_rt = Arc::new(Runtime::new().unwrap());
@@ -24,29 +22,31 @@ fn main() {
         .open()
         .expect("Failed to open database");
 
-    let payment_gateway = Arc::new(PaymentGateway::builder(PRIVATE_VIEW_KEY, PUBLIC_SPEND_KEY)
-        .scan_interval(Duration::from_millis(100))
-        .build());
+    let current_payment_id: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
     let auth_db = db.open_tree(b"auth_db").expect("Failed to open authorization tree, time to panic!");
-    let invoice_db = db.open_tree(b"invoice_db").expect("Failed to open invoice tree, time to panic!");
     let cookie_db = db.open_tree(b"cookie_db").expect("Failed to open cookie tree, time to panic!");
+    let money_db = db.open_tree(b"money_db").expect("Failed to open money tree, oh no");
 
     let auth_db = warp::any().map(move || auth_db.clone());
-    let invoice_db = warp::any().map(move || invoice_db.clone());
     let cookie_db_filter = {
         let cookie_db = cookie_db.clone();
         warp::any().map(move || cookie_db.clone())
+    }; 
+    let money_db_filter = {
+        let money_db_clone = money_db.clone();
+        warp::any().map(move || money_db_clone.clone())
     };
-
-    let payment_gateway_clone = payment_gateway.clone();
-    let payment_gateway_filter = warp::any().map(move || payment_gateway_clone.clone());
+    let wallet_filter = warp::any().map(move || wallet());
+    let current_payment_id_filter = warp::any().map(move || current_payment_id.clone());
 
     let register = warp::path("signup")
         // 2 KB limit to username + password
         .and(warp::body::content_length_limit(2048))
         .and(warp::body::form())
         .and(auth_db.clone())
+        .and(money_db_filter.clone())
+        .and(current_payment_id_filter.clone())
         .map(register);
 
     let login = warp::path("login")
@@ -57,41 +57,58 @@ fn main() {
         .and(cookie_db_filter.clone())
         .map(login);
 
-    let new_invoice = warp::path("new_invoice")
+    let deposit_req = warp::path("deposit_req")
         .and(warp::body::content_length_limit(2048))
         .and(warp::body::form())
-        .and(invoice_db.clone())
         .and(auth_db.clone())
         .and(cookie_db_filter.clone())
-        .and(payment_gateway_filter.clone())
-        .and_then(new_invoice);
+        .and(money_db_filter.clone())
+        .and(wallet_filter.clone())
+        .and_then(deposit_req);
 
-    let invoice_status = warp::path("invoice_status")
+    let get_balance = warp::path("get_balance")
         .and(warp::body::content_length_limit(2048))
         .and(warp::body::form())
-        .and(invoice_db.clone())
         .and(auth_db.clone())
+        .and(money_db_filter.clone())
         .and(cookie_db_filter.clone())
-        .and(payment_gateway_filter.clone())
-        .map(invoice_status);
+        .and_then(get_balance);
+
+    let attach_xmr_address = warp::path("attach_xmr_address")
+        .and(warp::body::content_length_limit(2048))
+        .and(warp::body::form())
+        .and(money_db_filter.clone())
+        .and(auth_db.clone())
+        .and(cookie_db_filter)
+        .map(attach_xmr_address);
 
     let post_routes = warp::post()
         .and(
             register
             .or(login)
-            .or(new_invoice)
-            .or(invoice_status)
+            .or(deposit_req)
+            .or(attach_xmr_address)
+            .or(get_balance)
         );
 
-    // All get requests should be compressed
 
-
-    let payment_gateway = payment_gateway.clone();
     let cookie_db = cookie_db.clone();
 
-    tokio_rt.spawn(async move { payment_gateway.run().await });
+    tokio_rt.spawn(update_acc_balances(money_db.clone(), wallet()));
     tokio_rt.spawn_blocking(move || destroy_expired_auth_cookies(cookie_db.clone()));
+
     tokio_rt.block_on(warp::serve(post_routes).run(([127, 0, 0, 1], 3030)));
 
 }
 
+fn wallet() -> &'static Wallet {
+    WALLET.get_or_init(|| {
+        let tokio_rt = Runtime::new().unwrap();
+
+        let wallet_rpc_addr = String::from("http://127.0.0.1:19000");
+        let daemon_rpc_addr = String::from("http://node.moneroworld.com:18089");
+
+        tokio_rt.block_on(Wallet::new(wallet_rpc_addr, daemon_rpc_addr, None, None))
+
+    })
+}
