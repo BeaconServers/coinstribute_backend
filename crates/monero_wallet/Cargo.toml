@@ -4,16 +4,18 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# For encoding and decoding monero address bytes to hex (TODO: Replace with hex_simd)
-hex = { version = "0.4" }
+# Faster hashmaps than std
+hashbrown = { version = "0.12" }
+# For encoding and decoding monero address bytes to hex, faster than hex lib
+hex-simd = { version = "0.5" }
 # A lot of functions for checking and generationg Monero addresses
 monero = { version = "0.16", features = ["serde_support"] }
 # Easy parallel processing
 rayon = { version = "1" }
 # An async request sending library in Rust
 reqwest = { version = "0.11", features = ["json"] }
-# A fast JSON parser that uses SIMD instrucctions (faster than serde_jsons)
-simd-json = { version = "0.4" }
+# A fast JSON parser that uses SIMD instructions (faster than serde_json)
+simd-json = { version = "0.4", features = ["serde"] }
 # Helpful for async stuff
 futures = { version = "0.3", default-features = false, features = ["async-await"] }
 # Serialization

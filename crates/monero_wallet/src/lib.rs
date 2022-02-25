@@ -30,7 +30,7 @@ impl Wallet {
             wallet_rpc.get_address(),
         ).unwrap();
         
-        let daemon_rpc = DaemonRPC::new(daemon_url, trusted_daemon, connection_timeout, send_timeout);        
+        let daemon_rpc = DaemonRPC::new(daemon_url, connection_timeout, send_timeout);
 
         Self {
             wallet_rpc,

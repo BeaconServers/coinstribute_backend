@@ -1,6 +1,6 @@
 use std::{time::Duration, str::FromStr};
 
-use hex::FromHexError;
+use hex_simd::AsciiCase;
 use monero::{util::address::PaymentId, Address};
 use rayon::prelude::*;
 use reqwest::{Client, ClientBuilder, Method};
@@ -16,8 +16,8 @@ impl WalletRPC {
 	pub(crate) fn new(wallet_daemon_url: String, connection_timeout: Option<Duration>, send_timeout: Option<Duration>) -> Self {
 		Self {
 			client: ClientBuilder::new()
-				.connect_timeout(connection_timeout.unwrap_or(Duration::from_millis(10000)))
-				.timeout(send_timeout.unwrap_or(Duration::from_millis(10000)))
+				.connect_timeout(connection_timeout.unwrap_or(Duration::from_millis(3500)))
+				.timeout(send_timeout.unwrap_or(Duration::from_millis(3500)))
 				.build()
 				.unwrap(),
 			wallet_daemon_url,
@@ -26,12 +26,31 @@ impl WalletRPC {
 	}
 
 	async fn request(&self, payload: &str) -> Result<simd_json::owned::Value, WalletRPCError> {
-		let req = self.client.request(Method::POST, self.wallet_daemon_url.clone() + "/json_rpc")
-			.body(payload.to_string())
-			.build()?;
+		let mut last_error = None;
+		const MAX_CONN_ATTEMPTS: u8 = 6;
 
-		let response = self.client.execute(req).await?;
-		Ok(response.json::<simd_json::owned::Value>().await?)
+		// Attempt up to 6 times to send a request before returning an error
+		for i in 0..MAX_CONN_ATTEMPTS {
+			let req = self.client.request(Method::POST, self.wallet_daemon_url.clone() + "/json_rpc")
+				.body(payload.to_string())
+				.build()?;
+
+			match self.client.execute(req).await {
+				Ok(response) => return Ok(response.json::<simd_json::owned::Value>().await?),
+				Err(err) => match err.is_timeout() {
+					true => {
+						if i == MAX_CONN_ATTEMPTS - 1 {
+							last_error = Some(err);
+						}
+
+						continue;
+					},
+					false => return Err(WalletRPCError::ReqwestError(err)),
+				},
+			};
+		}
+
+		return Err(WalletRPCError::ReqwestError(last_error.unwrap()))
 
 	}
 
@@ -66,7 +85,7 @@ impl WalletRPC {
 	pub async fn get_payments(&self, payment_id: PaymentId) -> Result<Vec<Payment>, WalletRPCError> {
 		let payment_id_hex = {
 			let payment_id_bytes = payment_id.as_bytes();
-			hex::encode(payment_id_bytes)
+			hex_simd::encode_to_boxed_str(payment_id_bytes, AsciiCase::Lower).into_string()
 
 		};
 
@@ -85,7 +104,7 @@ impl WalletRPC {
 
 			        	match payment_id_json.as_str() {
 			        		Some(id_str) => {
-			        			let hex_bytes = match hex::decode(id_str) {
+			        			let hex_bytes = match hex_simd::decode_to_boxed_bytes(id_str.as_bytes()) {
 			        				Ok(b) => b,
 			        				Err(e) => return Err(WalletRPCError::HexError(e)),
 			        			};
@@ -193,7 +212,7 @@ pub enum WalletRPCError {
 	InvalidSetDaemonReq,
 	MissingData,
 	AddrError(monero::util::address::Error),
-	HexError(FromHexError),
+	HexError(hex_simd::Error),
 	ReqwestError(reqwest::Error),
 
 }

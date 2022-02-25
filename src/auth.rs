@@ -1,6 +1,6 @@
 use std::time::SystemTime;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
 use argon2::{ThreadMode, Variant, Version};
 
@@ -225,8 +225,6 @@ pub(crate) fn destroy_expired_auth_cookies(auth_cookie_db: Tree) {
 				if current_time > auth_cookie.expiration_time {
 					// The cookie has expired, so it must be removed
 					auth_cookies_to_remove.push(username);
-					println!("Removing cookie");
-
 				}
 
 			} else {
