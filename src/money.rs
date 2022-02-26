@@ -22,6 +22,13 @@ pub struct AuthorizedReq {
 }
 
 #[derive(Deserialize)]
+pub struct UserTransfer {
+	username: String,
+	auth_cookie: String,
+	user_to_transfer_to: String,
+}
+
+#[derive(Deserialize)]
 pub(crate) struct AttachXMRAddress {
 	username: String,
 	auth_cookie: String,
@@ -88,6 +95,10 @@ pub(crate) async fn deposit_req(invoice_req: AuthorizedReq, auth_db: Tree, auth_
 	        .unwrap())
 
     }
+}
+
+pub fn transfer_req() {
+
 }
 
 pub async fn get_balance(auth_req: AuthorizedReq, auth_db: Tree, money_db: Tree, auth_cookie_db: Tree) -> Result<impl Reply, Rejection> {
@@ -174,7 +185,6 @@ pub async fn update_acc_balances(money_db: Tree, wallet: &Wallet) {
 			match &db_entry {
 				// TODO: Just use an Arc to get rid of all the cloning
 				Ok(entry) => {
-					println!("Updating acc balances...");
 					let (username, mut financial_info): (String, FinancialInfo) = (
 						bincode::deserialize(&entry.0).unwrap(), 
 						bincode::deserialize(&entry.1).unwrap(),
@@ -184,14 +194,15 @@ pub async fn update_acc_balances(money_db: Tree, wallet: &Wallet) {
 					let payments = match wallet.get_payments(payment_id).await {
 						Ok(payments) => payments,
 						Err(_err) => {
-							println!("Error on update: {_err:?}");
+							eprintln!("Error on update: {_err:?}");
 							num_of_errors += 1;
 
-							match num_of_errors < 5 {
-								true => continue,
-								false => panic!("Over 5 get_payments errors!"),
+							if num_of_errors >= 5 {
+								eprintln!("Over 5 get_payments errors!")
 
-							};
+							}
+
+							continue;
 						},
 
 					};
@@ -204,7 +215,23 @@ pub async fn update_acc_balances(money_db: Tree, wallet: &Wallet) {
 							}
 						}).cloned().collect();
 
-						batch.insert(bincode::serialize(&username).unwrap(), bincode::serialize(&financial_info).unwrap());
+						let username_bin = match bincode::serialize(&username) {
+							Ok(bin) => bin,
+							Err(e) => {
+								eprintln!("Could not serialize username due to error: {e:?}, this is very bad news!!!");
+								continue;
+							}
+						};
+
+						let financial_info_bin = match bincode::serialize(&financial_info) {
+							Ok(bin) => bin,
+							Err(e) => {
+								eprintln!("Could not serialize financial_info due to error: {e:?}, this is very bad news!!!");
+								continue;
+							}
+						};
+
+						batch.insert(username_bin, financial_info_bin);
 
 					}
 

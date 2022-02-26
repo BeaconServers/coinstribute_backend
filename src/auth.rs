@@ -208,8 +208,6 @@ fn auth_cookie_result_to_response(auth_cookie: &Result<AuthCookie, GenAuthCookie
 }
 
 pub(crate) fn destroy_expired_auth_cookies(auth_cookie_db: Tree) {
-	let mut auth_cookies_to_remove = Vec::new();
-
 	loop {
 		use std::thread::sleep;
 		use std::time::Duration;
@@ -224,7 +222,10 @@ pub(crate) fn destroy_expired_auth_cookies(auth_cookie_db: Tree) {
 
 				if current_time > auth_cookie.expiration_time {
 					// The cookie has expired, so it must be removed
-					auth_cookies_to_remove.push(username);
+					auth_cookie_db.remove(username).unwrap_or_else(|error| {
+                        eprintln!("Error reading auth_cookie db: {error:?}");
+                        None
+                    });
 				}
 
 			} else {
@@ -232,14 +233,6 @@ pub(crate) fn destroy_expired_auth_cookies(auth_cookie_db: Tree) {
 
 			}
 		});
-
-		auth_cookies_to_remove.iter().for_each(|username| {
-			if let Err(err) = auth_cookie_db.remove(username) {
-				eprintln!("Error reading auth_cookie db: {err:?}");
-			}
-		});
-
-		auth_cookies_to_remove.clear();
 
 		sleep(Duration::from_secs(1));
 
@@ -259,4 +252,11 @@ pub(crate) fn verify_auth_cookie(username: &str, cookie: &str, auth_cookie_db: &
 		None => false,
 	}
 	
+}
+
+fn username_is_valid(username: &str) -> bool {
+    const INVALID_USERNAMES: [&str; 8] = ["admin", "root", "sudo", "bootlegbilly", "susorodni", "billyb2", "billyb", "billy"];
+
+    todo!()
+
 }

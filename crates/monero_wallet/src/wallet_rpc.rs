@@ -63,14 +63,6 @@ impl WalletRPC {
 
 	}
 
-	pub async fn get_height(&self) -> Result<u64, WalletRPCError> {
-		const REQUEST_BODY: &'static str = r#"{"jsonrpc":"2.0","id":"0","method":"get_height"}"#;
-
-        let response = self.request(REQUEST_BODY).await?;
-        response["result"]["height"].as_u64().ok_or(WalletRPCError::MissingData)
-
-	}
-
 	pub async fn get_address(&self) -> Result<Address, WalletRPCError> {
 		const REQUEST_BODY: &'static str = r#"{"jsonrpc":"2.0","id":"0","method":"get_address","params":{"account_index":0}}}"#;
 
@@ -179,13 +171,25 @@ impl WalletRPC {
 		req_body.push_str(&trusted.to_string());
 		req_body.push_str(r#"}}"#);
 
-
         let response = self.request(&req_body).await?;
         
         match response.contains_key("result") {
         	true => Ok(()),
         	false => Err(WalletRPCError::InvalidSetDaemonReq),
         }
+	}
+
+	pub async fn set_refresh_time(&self, refresh_time: u64) -> Result<(), WalletRPCError> {
+		let mut req_body = String::from(r#"{"jsonrpc":"2.0","id":"0","method":"auto_refresh","params":{"period":"#);
+		req_body.push_str(&refresh_time.to_string());
+		req_body.push_str("}}");
+
+		let response = self.request(&req_body).await?;
+
+		match response.contains_key("result") {
+			true => Ok(()),
+			false => Err(WalletRPCError::InvalidSetRefreshReq),
+		}
 	}
 
 }
@@ -210,6 +214,7 @@ pub struct Payment {
 pub enum WalletRPCError {
 	InvalidPaymentId,
 	InvalidSetDaemonReq,
+	InvalidSetRefreshReq,
 	MissingData,
 	AddrError(monero::util::address::Error),
 	HexError(hex_simd::Error),

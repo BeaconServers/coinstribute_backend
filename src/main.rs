@@ -49,7 +49,7 @@ fn main() {
     let register = warp::path("signup")
         // 2 KB limit to username + password
         .and(warp::body::content_length_limit(2048))
-        .and(warp::body::form())
+        .and(warp::body::json())
         .and(auth_db.clone())
         .and(money_db_filter.clone())
         .and(current_payment_id_filter.clone())
@@ -58,14 +58,14 @@ fn main() {
     let login = warp::path("login")
         // 2 KB limit to username + password
         .and(warp::body::content_length_limit(2048))
-        .and(warp::body::form())
+        .and(warp::body::json())
         .and(auth_db.clone())
         .and(cookie_db_filter.clone())
         .map(login);
 
     let deposit_req = warp::path("deposit_req")
         .and(warp::body::content_length_limit(2048))
-        .and(warp::body::form())
+        .and(warp::body::json())
         .and(auth_db.clone())
         .and(cookie_db_filter.clone())
         .and(money_db_filter.clone())
@@ -75,7 +75,7 @@ fn main() {
 
     let get_balance = warp::path("get_balance")
         .and(warp::body::content_length_limit(2048))
-        .and(warp::body::form())
+        .and(warp::body::json())
         .and(auth_db.clone())
         .and(money_db_filter.clone())
         .and(cookie_db_filter.clone())
@@ -83,7 +83,7 @@ fn main() {
 
     let attach_xmr_address = warp::path("attach_xmr_address")
         .and(warp::body::content_length_limit(2048))
-        .and(warp::body::form())
+        .and(warp::body::json())
         .and(money_db_filter.clone())
         .and(auth_db.clone())
         .and(cookie_db_filter)

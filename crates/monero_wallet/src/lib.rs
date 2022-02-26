@@ -25,9 +25,10 @@ impl Wallet {
 
         let wallet_rpc = WalletRPC::new(wallet_url, connection_timeout, send_timeout);
 
-        let (_, addr) = try_join!(
+        let (_, addr, _) = try_join!(
             wallet_rpc.set_daemon(&daemon_url, trusted_daemon),
             wallet_rpc.get_address(),
+            wallet_rpc.set_refresh_time(60),
         ).unwrap();
         
         let daemon_rpc = DaemonRPC::new(daemon_url, connection_timeout, send_timeout);
@@ -51,7 +52,7 @@ impl Wallet {
 
     }
 
-    /// Get the current balance of this monero wallet
+    /// Get the current total balance of this monero wallet (including all user balances)
     pub async fn get_balance(&self) -> Result<u64, WalletError> {
         Ok(self.wallet_rpc.get_balance().await?)
 
@@ -59,7 +60,7 @@ impl Wallet {
 
     /// Get the current block height of the monero daemon
     pub async fn get_height(&self) -> Result<u64, WalletError> {
-        Ok(self.wallet_rpc.get_height().await?)
+        Ok(self.daemon_rpc.daemon_height().await?)
 
     }
 
