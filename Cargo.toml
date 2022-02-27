@@ -27,7 +27,7 @@ monero = { version = "0.16", default-features = false, features = ["serde_suppor
 # Lazy initialization of globals
 once_cell = { version = "1" }
 # Very fast HTTP server library
-warp = { version = "0.3" }
+warp = { version = "0.3", default-features = false }
 # Very fast database library
 sled = { version = "0.34", features = ["miri_optimizations", "io_uring"] }
 # Multi-threaded async runtime
@@ -35,12 +35,13 @@ tokio = { version = "1", default-features = false, features = ["macros", "rt-mul
 # A very secure hashing library
 rust-argon2 = { version = "1" }
 # Random data generator
-rand = { version = "0.8" }
+rand = { version = "0.8", features = ["simd_support"] }
 # Easy parallel computation
 rayon = { version = "1" }
 # It's serde
 serde_derive = { version = "1" }
 serde = { version = "1" }
+# Very fast JSON Serialization/Deserialization
 simd-json = { version = "0.4", features = ["serde"]}
 # Library written by a cool guy for dealing with Monero wallet RPC
 monero_wallet = { path = "crates/monero_wallet" }
