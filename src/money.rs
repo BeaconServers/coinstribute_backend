@@ -194,7 +194,6 @@ pub async fn update_acc_balances(money_db: Tree, wallet: &Wallet) {
 					let payments = match wallet.get_payments(payment_id).await {
 						Ok(payments) => payments,
 						Err(_err) => {
-							eprintln!("Error on update: {_err:?}");
 							num_of_errors += 1;
 
 							if num_of_errors >= 5 {

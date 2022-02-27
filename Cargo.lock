@@ -143,6 +143,7 @@ dependencies = [
  "rust-argon2",
  "serde",
  "serde_derive",
+ "simd-json",
  "sled",
  "tokio",
  "warp",

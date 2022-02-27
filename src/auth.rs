@@ -89,6 +89,13 @@ pub(crate) fn register(user_info: AuthRequest, auth_db: Tree, money_db: Tree, cu
 
         },
         false => {
+            if !username_is_valid(&username) {
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body("Invalid username".to_string())
+                    .unwrap();
+            }
+
             let mut salt: [u8; 32] = [0; 32];
             rand::thread_rng().fill_bytes(&mut salt);
 
@@ -134,7 +141,7 @@ pub(crate) fn login(user_info: AuthRequest, auth_db: Tree, auth_cookie_db: Tree)
                 // Login successful
                 true => {
                 	let auth_cookie = generate_auth_cookie(&username, &auth_db, auth_cookie_db);
-                	auth_cookie_result_to_response(&auth_cookie)
+                	auth_cookie_result_to_response(username, &auth_cookie)
 
                 },
                 false => Response::builder()
@@ -190,7 +197,7 @@ fn generate_auth_cookie(username: &str, auth_db: &Tree, auth_cookie_db: Tree) ->
 
 }
 
-fn auth_cookie_result_to_response(auth_cookie: &Result<AuthCookie, GenAuthCookieErr>) -> Response<String> {
+fn auth_cookie_result_to_response(username: String, auth_cookie: &Result<AuthCookie, GenAuthCookieErr>) -> Response<String> {
 	Response::builder()
 		.status(match auth_cookie.as_ref().err() {
 			Some(err) => match err {
@@ -201,8 +208,16 @@ fn auth_cookie_result_to_response(auth_cookie: &Result<AuthCookie, GenAuthCookie
 			None => StatusCode::OK,
 		})
 		.body(match auth_cookie {
-			Ok(auth_cookie) => format!("Login successful\nCookie: {:?}\nExpiration time: {:?}", auth_cookie.cookie, auth_cookie.expiration_time),
-			Err(err) => format!("{err:?}"), 
+			Ok(auth_cookie) => {
+                let resp = LoginRequestResponse {
+                    username,
+                    cookie: auth_cookie.cookie.clone(),
+                    exp_time: auth_cookie.expiration_time,
+                };
+
+                simd_json::to_string(&resp).unwrap()
+            },
+			Err(err) => format!("{err:?}"),
 		})
 		.unwrap()
 }
@@ -240,6 +255,13 @@ pub(crate) fn destroy_expired_auth_cookies(auth_cookie_db: Tree) {
 
 }
 
+#[derive(Serialize)]
+struct LoginRequestResponse {
+    username: String,
+    cookie: String,
+    exp_time: u64,
+}
+
 pub(crate) fn verify_auth_cookie(username: &str, cookie: &str, auth_cookie_db: &Tree) -> bool {
 	let username_bytes = bincode::serialize(username).unwrap();
 
@@ -257,6 +279,6 @@ pub(crate) fn verify_auth_cookie(username: &str, cookie: &str, auth_cookie_db: &
 fn username_is_valid(username: &str) -> bool {
     const INVALID_USERNAMES: [&str; 8] = ["admin", "root", "sudo", "bootlegbilly", "susorodni", "billyb2", "billyb", "billy"];
 
-    todo!()
+    username.chars().all(char::is_alphanumeric) && !INVALID_USERNAMES.contains(&username.to_lowercase().as_str())
 
 }

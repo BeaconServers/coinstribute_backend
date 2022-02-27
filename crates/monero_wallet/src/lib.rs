@@ -24,14 +24,9 @@ impl Wallet {
         let trusted_daemon = daemon_url.contains("127.0.0.1");
 
         let wallet_rpc = WalletRPC::new(wallet_url, connection_timeout, send_timeout);
-
-        let (_, addr, _) = try_join!(
-            wallet_rpc.set_daemon(&daemon_url, trusted_daemon),
-            wallet_rpc.get_address(),
-            wallet_rpc.set_refresh_time(60),
-        ).unwrap();
-        
         let daemon_rpc = DaemonRPC::new(daemon_url, connection_timeout, send_timeout);
+
+        let addr = wallet_rpc.get_address().await.unwrap();
 
         Self {
             wallet_rpc,
@@ -72,6 +67,13 @@ impl Wallet {
         Ok(self.daemon_rpc.get_fee().await?)
     }
 
+    pub async fn set_daemon(&self, daemon_url: &str, trusted: bool) -> Result<(), WalletError> {
+        Ok(self.wallet_rpc.set_daemon(daemon_url, trusted).await?)
+    }
+
+    pub async fn set_refresh_time(&self, time: u64) -> Result<(), WalletError> {
+        Ok(self.wallet_rpc.set_refresh_time(time).await?)
+    }
 }
 
 #[derive(Debug)]

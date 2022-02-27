@@ -1,15 +1,22 @@
 mod auth;
 mod money;
 
+use std::convert::Infallible;
+use std::error::Error;
 use std::sync::{Arc, atomic::AtomicU64};
 
 use monero_wallet::Wallet;
-use once_cell::sync::OnceCell;
+use once_cell::sync::{Lazy, OnceCell};
+use serde_derive::Serialize;
 use tokio::runtime::Runtime;
-use warp::Filter;
+use warp::{Filter, Rejection, Reply};
+use warp::http::StatusCode;
 
 use auth::*;
 use money::*;
+
+static WALLET_RPC_ADDR: Lazy<String> = Lazy::new(|| String::from("http://127.0.0.1:19000"));
+static DAEMON_ADDR: Lazy<String> = Lazy::new(|| String::from("http://node.moneroworld.com:18089"));
 
 static WALLET: OnceCell<Wallet> = OnceCell::new();
 
@@ -101,11 +108,23 @@ fn main() {
 
     let cookie_db = cookie_db.clone();
 
+    tokio_rt.spawn(async move {
+        let wallet = wallet();
+
+        let mut set_settings = false;
+
+        while !set_settings {
+            set_settings = tokio::try_join!(
+                wallet.set_daemon(&DAEMON_ADDR, DAEMON_ADDR.contains("127.0.0.1")),
+                wallet.set_refresh_time(60),
+            ).is_ok();
+        }
+    });
     tokio_rt.spawn(update_acc_balances(money_db.clone(), wallet()));
     tokio_rt.spawn(update_cached_fee(cached_fee.clone(), wallet()));
     tokio_rt.spawn_blocking(move || destroy_expired_auth_cookies(cookie_db.clone()));
 
-    tokio_rt.block_on(warp::serve(post_routes).run(([127, 0, 0, 1], 3030)));
+    tokio_rt.block_on(warp::serve(post_routes.recover(handle_rejection)).run(([127, 0, 0, 1], 3030)));
 
 }
 
@@ -115,10 +134,54 @@ fn wallet() -> &'static Wallet {
         // Should I TODO replace this with futures library? Also yes.
         let tokio_rt = Runtime::new().unwrap();
 
-        let wallet_rpc_addr = String::from("http://127.0.0.1:19000");
-        let daemon_rpc_addr = String::from("http://node.moneroworld.com:18089");
-
-        tokio_rt.block_on(Wallet::new(wallet_rpc_addr, daemon_rpc_addr, None, None))
-
+        println!("Initialized wallet");
+        tokio_rt.block_on(Wallet::new(WALLET_RPC_ADDR.clone(), DAEMON_ADDR.clone(), None, None))
     })
+}
+
+#[derive(Serialize)]
+struct ErrorMessage {
+    code: u16,
+    message: String,
+}
+
+async fn handle_rejection(err: Rejection) -> Result<impl Reply, Infallible> {
+    let code;
+    let message;
+
+    if err.is_not_found() {
+        code = StatusCode::NOT_FOUND;
+        message = "NOT_FOUND";
+    } else if let Some(e) = err.find::<warp::filters::body::BodyDeserializeError>() {
+        // This error happens if the body could not be deserialized correctly
+        // We can use the cause to analyze the error and customize the error message
+        message = match e.source() {
+            Some(cause) => {
+                if cause.to_string().contains("denom") {
+                    "FIELD_ERROR: denom"
+                } else {
+                    "BAD_REQUEST"
+                }
+            }
+            None => "BAD_REQUEST",
+        };
+        code = StatusCode::BAD_REQUEST;
+    } else if let Some(_) = err.find::<warp::reject::MethodNotAllowed>() {
+        // We can handle a specific error, here METHOD_NOT_ALLOWED,
+        // and render it however we want
+        code = StatusCode::METHOD_NOT_ALLOWED;
+        message = "METHOD_NOT_ALLOWED";
+    } else {
+        // We should have expected this... Just log and say its a 500
+        eprintln!("unhandled rejection: {:?}", err);
+        code = StatusCode::INTERNAL_SERVER_ERROR;
+        message = "UNHANDLED_REJECTION";
+    }
+
+    let json = warp::reply::json(&ErrorMessage {
+        code: code.as_u16(),
+        message: message.into(),
+    });
+
+    Ok(warp::reply::with_status(json, code))
 }
