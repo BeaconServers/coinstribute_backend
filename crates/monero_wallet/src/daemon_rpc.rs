@@ -44,8 +44,8 @@ impl DaemonRPC {
 	pub(crate) fn new(daemon_url: String, connection_timeout: Option<Duration>, send_timeout: Option<Duration>) -> Self {
 		Self {
 			client: ClientBuilder::new()
-				.connect_timeout(connection_timeout.unwrap_or(Duration::from_millis(3500)))
-				.timeout(send_timeout.unwrap_or(Duration::from_millis(3500)))
+				.connect_timeout(connection_timeout.unwrap_or(Duration::from_millis(1000)))
+				.timeout(send_timeout.unwrap_or(Duration::from_millis(1000)))
 				.build()
 				.unwrap(),
 			daemon_url,
@@ -55,9 +55,9 @@ impl DaemonRPC {
 
 	async fn request(&self, payload: &str, endpoint: &str) -> Result<simd_json::owned::Value, DaemonRPCError> {
 		let mut last_error = None;
-		const MAX_CONN_ATTEMPTS: u8 = 6;
+		const MAX_CONN_ATTEMPTS: u8 = 5;
 
-		// Attempt up to 6 times to send a request before returning an error
+		// Attempt up to 5 times to send a request before returning an error
 		for i in 0..MAX_CONN_ATTEMPTS {
 			let req = self.client.request(Method::POST, self.daemon_url.clone() + endpoint)
 				.body(payload.to_string())
@@ -241,7 +241,7 @@ impl DaemonRPC {
 
 		let count = res["result"]["count"]
 			.as_u64()
-			.ok_or_else(|| DaemonRPCError::MissingData)?;
+			.ok_or(DaemonRPCError::MissingData)?;
 
 		Ok(count)
 	}

@@ -1,4 +1,5 @@
-use std::time::SystemTime;
+use std::fmt::Display;
+use std::time::{SystemTime, Duration};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
@@ -7,23 +8,39 @@ use argon2::{ThreadMode, Variant, Version};
 use rand::prelude::*;
 use rand::distributions::Alphanumeric;
 
+use once_cell::sync::Lazy;
+
 use sled::Tree;
 use serde::{Serialize, Deserialize};
+use warp::reply::Reply;
 use warp::{http::Response, hyper::StatusCode};
+use warp::Rejection;
 
+use crate::{DenialFault, RequestDenial};
 use crate::money::FinancialInfo;
 
-pub(crate) const ARGON2_CONFIG: argon2::Config = argon2::Config {
+pub(crate) static ARGON2_CONFIG: Lazy<argon2::Config> = Lazy::new(|| argon2::Config {
     ad: &[],
     hash_length: 32,
-    lanes: 4,
+    lanes: {
+       let num_threads: usize = std::thread::available_parallelism().unwrap().into();
+       let num_threads: u32 = num_threads.try_into().unwrap();
+
+       num_threads
+    },
     mem_cost: 4096,
     secret: &[],
     thread_mode: ThreadMode::Parallel,
     time_cost: 3,
     variant: Variant::Argon2i,
     version: Version::Version13,
-};
+});
+
+
+const RESERVED_USERNAMES: [&str; 8] = ["admin", "root", "sudo", "bootlegbilly", "susorodni", "billyb2", "billyb", "billy"];
+
+const MIN_USER_LEN: usize = 4;
+const MAX_USER_LEN: usize = 30;
 
 #[derive(Deserialize)]
 pub struct AuthRequest {
@@ -58,6 +75,24 @@ enum GenAuthCookieErr {
 
 }
 
+enum InvalidUserReason {
+    UsernameLenIncorrect,
+    NotAlphanumeric,
+    ReservedUsername,
+}
+
+impl Display for InvalidUserReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::auth::InvalidUserReason::*;
+
+        match self {
+            UsernameLenIncorrect => write!(f, "The username given is too short! (Must be between {} and {} long", MIN_USER_LEN, MAX_USER_LEN),
+            NotAlphanumeric => write!(f, "The username given is not alphanumeric"),
+            ReservedUsername => write!(f, "The username given is one of the following reserved usernames: {:?}", RESERVED_USERNAMES),
+        }
+    }
+}
+
 impl From<sled::Error> for GenAuthCookieErr {
     fn from(err: sled::Error) -> Self {
         Self::DbErr(err)
@@ -72,28 +107,32 @@ impl From<bincode::Error> for GenAuthCookieErr {
     }
 }
 
-pub(crate) fn register(user_info: AuthRequest, auth_db: Tree, money_db: Tree, current_payment_id: Arc<AtomicU64>) -> Response<String> {
+pub(crate) async fn register(user_info: AuthRequest, auth_db: Tree, money_db: Tree, auth_cookie_db: Tree, current_payment_id: Arc<AtomicU64>) -> Result<impl Reply, Rejection> {
     let username = user_info.username;
     let password = user_info.password;
 
     let username_bytes = bincode::serialize(&username).unwrap();
 
-    let user_exists = auth_db.contains_key(&username_bytes).unwrap();
-
-    match user_exists {
+   let get_response = move || -> (StatusCode, Box<dyn erased_serde::Serialize + Send>) { match auth_db.contains_key(&username_bytes).unwrap() {
         true => {
-        Response::builder()
-            .status(StatusCode::CONFLICT)
-            .body("Username already registered".to_string())
-            .unwrap()
+            let login_req_denial = RequestDenial::new(
+                DenialFault::User,
+                "Username already registered".to_string(),
+        String::new(),
+                );
+
+                (StatusCode::CONFLICT, Box::new(login_req_denial))
 
         },
         false => {
-            if !username_is_valid(&username) {
-                return Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .body("Invalid username".to_string())
-                    .unwrap();
+            if let Some(reason) = invalid_user_reason(&username) {
+                let login_req_denial = RequestDenial::new(
+                DenialFault::User,
+                reason.to_string(),
+        String::new(),
+                );
+
+                return (StatusCode::BAD_GATEWAY, Box::new(login_req_denial));
             }
 
             let mut salt: [u8; 32] = [0; 32];
@@ -101,10 +140,16 @@ pub(crate) fn register(user_info: AuthRequest, auth_db: Tree, money_db: Tree, cu
 
             let hashed_password = match argon2::hash_raw(password.as_bytes(), &salt, &ARGON2_CONFIG).ok() {
                 Some(hash) => hash,
-                None => return Response::builder()
-                  .status(StatusCode::INTERNAL_SERVER_ERROR)
-                  .body("Internal Server Error".to_string())
-                  .unwrap()
+                None => {
+                    let denial = RequestDenial::new(
+                DenialFault::Server,
+                "Internal Server Error".to_string(),
+        String::new(),
+                    );
+
+                    return (StatusCode::INTERNAL_SERVER_ERROR, Box::new(denial));
+
+                }
 
             };
 
@@ -119,21 +164,39 @@ pub(crate) fn register(user_info: AuthRequest, auth_db: Tree, money_db: Tree, cu
             auth_db.insert(&username_bytes, user_bytes).unwrap();
             money_db.insert(&username_bytes, bincode::serialize(&FinancialInfo::new(current_payment_id)).unwrap()).unwrap();
 
-            Response::builder()
-                .status(StatusCode::OK)
-                .body("Added new user!".to_string())
-                .unwrap()
+            let cookie = generate_auth_cookie(&user.username, &auth_db, auth_cookie_db);
+
+            auth_cookie_result_to_response(user.username, cookie)
+
         }
 
-    }
+    }};
+
+    let (res, _) = tokio::join!(
+        tokio::task::spawn_blocking(get_response),
+        tokio::time::sleep(Duration::from_millis(800)),
+    );
+
+    let (code, json) = res.unwrap();
+
+    Ok(Response::builder()
+        .status(code)
+        .body(simd_json::to_string(&json).unwrap())
+        .unwrap())
 
 }
 
-pub(crate) fn login(user_info: AuthRequest, auth_db: Tree, auth_cookie_db: Tree) -> Response<String> {
+pub(crate) async fn login(user_info: AuthRequest, auth_db: Tree, auth_cookie_db: Tree) -> Result<impl Reply, Rejection> {
     let username = user_info.username;
     let password = user_info.password;
 
-    match auth_db.get(bincode::serialize(&username).unwrap()).unwrap() {
+    let wrong_user_or_pass: (StatusCode, Box<dyn erased_serde::Serialize + Send>) = (StatusCode::UNAUTHORIZED, Box::new(RequestDenial::new(
+        DenialFault::User,
+        "Wrong username or password".to_string(),
+String::new(),
+    )));
+
+    let give_response = move || match auth_db.get(bincode::serialize(&username).unwrap()).unwrap() {
         Some(user_info_bytes) => {
             let user_info: User = bincode::deserialize(&user_info_bytes).unwrap();
 
@@ -141,22 +204,28 @@ pub(crate) fn login(user_info: AuthRequest, auth_db: Tree, auth_cookie_db: Tree)
                 // Login successful
                 true => {
                 	let auth_cookie = generate_auth_cookie(&username, &auth_db, auth_cookie_db);
-                	auth_cookie_result_to_response(username, &auth_cookie)
+                	auth_cookie_result_to_response(username, auth_cookie)
 
                 },
-                false => Response::builder()
-                    .status(StatusCode::UNAUTHORIZED)
-                    .body("Wrong username or password".to_string())
-                    .unwrap()
+                false => wrong_user_or_pass,
 
             }
 
         },
-        None => Response::builder()
-                .status(StatusCode::UNAUTHORIZED)
-                .body("Wrong username or password".to_string())
-                .unwrap()
-    }
+        None =>wrong_user_or_pass,
+    };
+
+    let (res, _) = tokio::join!(
+        tokio::task::spawn_blocking(give_response),
+        tokio::time::sleep(Duration::from_millis(800)),
+    );
+
+    let (code, json) = res.unwrap();
+
+    Ok(Response::builder()
+        .status(code)
+        .body(simd_json::to_string(&json).unwrap())
+        .unwrap())
 
 }
 
@@ -197,35 +266,38 @@ fn generate_auth_cookie(username: &str, auth_db: &Tree, auth_cookie_db: Tree) ->
 
 }
 
-fn auth_cookie_result_to_response(username: String, auth_cookie: &Result<AuthCookie, GenAuthCookieErr>) -> Response<String> {
-	Response::builder()
-		.status(match auth_cookie.as_ref().err() {
-			Some(err) => match err {
-				GenAuthCookieErr::UserDoesntExist => StatusCode::UNAUTHORIZED,
-				GenAuthCookieErr::DbErr(_) => StatusCode::INTERNAL_SERVER_ERROR,
-				GenAuthCookieErr::BincodeErr(_) => StatusCode::INTERNAL_SERVER_ERROR,
-			},
-			None => StatusCode::OK,
-		})
-		.body(match auth_cookie {
+fn auth_cookie_result_to_response(username: String, auth_cookie: Result<AuthCookie, GenAuthCookieErr>) -> (StatusCode, Box<dyn erased_serde::Serialize + Send>) {
+    (match auth_cookie.as_ref().err() {
+        Some(err) => match err {
+            GenAuthCookieErr::UserDoesntExist => StatusCode::UNAUTHORIZED,
+            GenAuthCookieErr::DbErr(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            GenAuthCookieErr::BincodeErr(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        },
+        None => StatusCode::OK,
+    },
+    match auth_cookie {
 			Ok(auth_cookie) => {
-                let resp = LoginRequestResponse {
+                Box::new(AuthReqResponse {
                     username,
                     cookie: auth_cookie.cookie.clone(),
                     exp_time: auth_cookie.expiration_time,
-                };
+                })
 
-                simd_json::to_string(&resp).unwrap()
             },
-			Err(err) => format!("{err:?}"),
-		})
-		.unwrap()
+			Err(_err) => {
+                Box::new(RequestDenial::new(
+            DenialFault::Server,
+            "Internal Server Error".to_string(),
+    "".to_string(),
+                ))
+            },
+		}
+    )
 }
 
 pub(crate) fn destroy_expired_auth_cookies(auth_cookie_db: Tree) {
 	loop {
 		use std::thread::sleep;
-		use std::time::Duration;
 
 		let current_time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
 
@@ -256,7 +328,7 @@ pub(crate) fn destroy_expired_auth_cookies(auth_cookie_db: Tree) {
 }
 
 #[derive(Serialize)]
-struct LoginRequestResponse {
+struct AuthReqResponse {
     username: String,
     cookie: String,
     exp_time: u64,
@@ -273,12 +345,24 @@ pub(crate) fn verify_auth_cookie(username: &str, cookie: &str, auth_cookie_db: &
 		},
 		None => false,
 	}
-	
+
 }
 
-fn username_is_valid(username: &str) -> bool {
-    const INVALID_USERNAMES: [&str; 8] = ["admin", "root", "sudo", "bootlegbilly", "susorodni", "billyb2", "billyb", "billy"];
+/// Returns Some(InvalidUserReason) if the username is invalid
+fn invalid_user_reason(username: &str) -> Option<InvalidUserReason> {
+    if username.len() < MIN_USER_LEN || username.len() > MAX_USER_LEN {
+        Some(InvalidUserReason::UsernameLenIncorrect)
 
-    username.chars().all(char::is_alphanumeric) && !INVALID_USERNAMES.contains(&username.to_lowercase().as_str())
+    } else if !username.chars().all(char::is_alphanumeric) {
+        Some(InvalidUserReason::NotAlphanumeric)
+
+    } else if RESERVED_USERNAMES.contains(&username.to_lowercase().as_str()) {
+        Some(InvalidUserReason::ReservedUsername)
+        
+    } else {
+        None
+
+    }
+   
 
 }

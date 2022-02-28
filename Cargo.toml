@@ -41,6 +41,7 @@ rayon = { version = "1" }
 # It's serde
 serde_derive = { version = "1" }
 serde = { version = "1" }
+erased-serde = { version = "0.3" }
 # Very fast JSON Serialization/Deserialization
 simd-json = { version = "0.4", features = ["serde"]}
 # Library written by a cool guy for dealing with Monero wallet RPC

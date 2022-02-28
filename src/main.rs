@@ -46,7 +46,7 @@ fn main() {
         let money_db_clone = money_db.clone();
         warp::any().map(move || money_db_clone.clone())
     };
-    let wallet_filter = warp::any().map(move || wallet());
+    let wallet_filter = warp::any().map(wallet);
     let current_payment_id_filter = warp::any().map(move || current_payment_id.clone());
     let cached_fee_filter = {
         let cached_fee = cached_fee.clone();
@@ -59,8 +59,9 @@ fn main() {
         .and(warp::body::json())
         .and(auth_db.clone())
         .and(money_db_filter.clone())
-        .and(current_payment_id_filter.clone())
-        .map(register);
+        .and(cookie_db_filter.clone())
+        .and(current_payment_id_filter)
+        .and_then(register);
 
     let login = warp::path("login")
         // 2 KB limit to username + password
@@ -68,7 +69,7 @@ fn main() {
         .and(warp::body::json())
         .and(auth_db.clone())
         .and(cookie_db_filter.clone())
-        .map(login);
+        .and_then(login);
 
     let deposit_req = warp::path("deposit_req")
         .and(warp::body::content_length_limit(2048))
@@ -76,8 +77,8 @@ fn main() {
         .and(auth_db.clone())
         .and(cookie_db_filter.clone())
         .and(money_db_filter.clone())
-        .and(wallet_filter.clone())
-        .and(cached_fee_filter.clone())
+        .and(wallet_filter)
+        .and(cached_fee_filter)
         .and_then(deposit_req);
 
     let get_balance = warp::path("get_balance")
@@ -91,8 +92,8 @@ fn main() {
     let attach_xmr_address = warp::path("attach_xmr_address")
         .and(warp::body::content_length_limit(2048))
         .and(warp::body::json())
-        .and(money_db_filter.clone())
-        .and(auth_db.clone())
+        .and(money_db_filter)
+        .and(auth_db)
         .and(cookie_db_filter)
         .map(attach_xmr_address);
 
@@ -106,8 +107,6 @@ fn main() {
         );
 
 
-    let cookie_db = cookie_db.clone();
-
     tokio_rt.spawn(async move {
         let wallet = wallet();
 
@@ -119,10 +118,13 @@ fn main() {
                 wallet.set_refresh_time(60),
             ).is_ok();
         }
+
+        println!("Successfully configured wallet sync");
+
     });
-    tokio_rt.spawn(update_acc_balances(money_db.clone(), wallet()));
-    tokio_rt.spawn(update_cached_fee(cached_fee.clone(), wallet()));
-    tokio_rt.spawn_blocking(move || destroy_expired_auth_cookies(cookie_db.clone()));
+    tokio_rt.spawn(update_acc_balances(money_db, wallet()));
+    tokio_rt.spawn(update_cached_fee(cached_fee, wallet()));
+    tokio_rt.spawn_blocking(move || destroy_expired_auth_cookies(cookie_db));
 
     tokio_rt.block_on(warp::serve(post_routes.recover(handle_rejection)).run(([127, 0, 0, 1], 3030)));
 
@@ -166,7 +168,7 @@ async fn handle_rejection(err: Rejection) -> Result<impl Reply, Infallible> {
             None => "BAD_REQUEST",
         };
         code = StatusCode::BAD_REQUEST;
-    } else if let Some(_) = err.find::<warp::reject::MethodNotAllowed>() {
+    } else if err.find::<warp::reject::MethodNotAllowed>().is_some() {
         // We can handle a specific error, here METHOD_NOT_ALLOWED,
         // and render it however we want
         code = StatusCode::METHOD_NOT_ALLOWED;
@@ -184,4 +186,39 @@ async fn handle_rejection(err: Rejection) -> Result<impl Reply, Infallible> {
     });
 
     Ok(warp::reply::with_status(json, code))
+}
+
+enum DenialFault {
+    Server,
+    User,
+    ServerAndUser,
+    Unknown,
+}
+
+impl std::fmt::Display for DenialFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", match self {
+            DenialFault::Server => "Server",
+            DenialFault::User => "User",
+            DenialFault::ServerAndUser => "Server and User",
+            DenialFault::Unknown => "Unknown",
+        })
+    }
+}
+
+#[derive(Serialize)]
+struct RequestDenial {
+    fault: String,
+    reason: String,
+    additional_info: String,
+}
+
+impl RequestDenial {
+    fn new(fault: DenialFault, reason: String, additional_info: String) -> Self {
+        Self {
+            fault: fault.to_string(),
+            reason,
+            additional_info,
+        }
+    }
 }

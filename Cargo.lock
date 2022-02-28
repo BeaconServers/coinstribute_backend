@@ -110,6 +110,7 @@ name = "coinstribute"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "erased-serde",
  "monero",
  "monero_wallet",
  "once_cell",
@@ -254,6 +255,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7896dc8abb250ffdda33912550faa54c88ec8b998dec0b2c55ab224921ce11df"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "erased-serde"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56047058e1ab118075ca22f9ecd737bcc961aa3566a3019cb71388afa280bd8a"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

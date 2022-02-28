@@ -27,9 +27,9 @@ impl WalletRPC {
 
 	async fn request(&self, payload: &str) -> Result<simd_json::owned::Value, WalletRPCError> {
 		let mut last_error = None;
-		const MAX_CONN_ATTEMPTS: u8 = 6;
+		const MAX_CONN_ATTEMPTS: u8 = 5;
 
-		// Attempt up to 6 times to send a request before returning an error
+		// Attempt up to 5 times to send a request before returning an error
 		for i in 0..MAX_CONN_ATTEMPTS {
 			let req = self.client.request(Method::POST, self.wallet_daemon_url.clone() + "/json_rpc")
 				.body(payload.to_string())

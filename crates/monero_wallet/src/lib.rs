@@ -6,7 +6,6 @@ use std::time::Duration;
 use daemon_rpc::{DaemonRPC, DaemonRPCError};
 use monero::Network;
 use wallet_rpc::{WalletRPC, WalletRPCError};
-use futures::try_join;
 
 pub use monero::util::address::{Address, PaymentId};
 pub use wallet_rpc::Payment;
@@ -20,18 +19,20 @@ pub struct Wallet {
 
 impl Wallet {
     pub async fn new(wallet_url: String, daemon_url: String, connection_timeout: Option<Duration>, send_timeout: Option<Duration>) -> Self {
-        // Local daemon connections are trusted, everything else is not
-        let trusted_daemon = daemon_url.contains("127.0.0.1");
-
         let wallet_rpc = WalletRPC::new(wallet_url, connection_timeout, send_timeout);
         let daemon_rpc = DaemonRPC::new(daemon_url, connection_timeout, send_timeout);
 
-        let addr = wallet_rpc.get_address().await.unwrap();
+        let mut addr: Option<Address> = None;
+
+        while addr == None {
+            addr = wallet_rpc.get_address().await.ok();
+            
+        }
 
         Self {
             wallet_rpc,
             daemon_rpc,
-            addr,
+            addr: addr.unwrap(),
         }
     }
 

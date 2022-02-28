@@ -1,3 +1,4 @@
+use crate::{RequestDenial, DenialFault};
 use crate::auth::verify_auth_cookie;
 
 use std::str::FromStr;
@@ -67,10 +68,16 @@ impl FinancialInfo {
 	}
 }
 
+#[derive(Serialize)]
+struct DepositReqResp {
+	addr: String,
+	min_amt: u64,
+}
+
 pub(crate) async fn deposit_req(invoice_req: AuthorizedReq, auth_db: Tree, auth_cookie_db: Tree, money_db: Tree, wallet: &Wallet, cached_fee: Arc<CachedFee>) -> Result<impl Reply, Rejection> {
 	let invoice_req_username_bytes = bincode::serialize(&invoice_req.username).unwrap();
 
-	if verify_auth_cookie(&invoice_req.username, &invoice_req.auth_cookie, &auth_cookie_db) && auth_db.contains_key(invoice_req_username_bytes).unwrap() {
+	let (code, json_resp): (StatusCode, Box<dyn erased_serde::Serialize + Send>) = if verify_auth_cookie(&invoice_req.username, &invoice_req.auth_cookie, &auth_cookie_db) && auth_db.contains_key(invoice_req_username_bytes).unwrap() {
 		let username = &invoice_req.username;
 
 		let payment_id = {
@@ -81,45 +88,63 @@ pub(crate) async fn deposit_req(invoice_req: AuthorizedReq, auth_db: Tree, auth_
 		};
 
 		let addr = wallet.new_integrated_addr(payment_id);
-        let fee = cached_fee.get_fee(&wallet).await;
+        let fee = cached_fee.get_fee(wallet).await;
 
-		Ok(Response::builder()
-	        .status(StatusCode::OK)
-	        .body(format!("Deposit to {addr} with at least {} Monero", (fee as f64 * 10.0) / (10_u64.pow(12) as f64) ))
-	        .unwrap())
-			
+
+		(StatusCode::OK, Box::new(DepositReqResp {
+			addr: addr.to_string(),
+			min_amt: fee * 10,
+		}))
+
     } else {
-    	Ok(Response::builder()
-	        .status(StatusCode::UNAUTHORIZED)
-	        .body("Invalid username or cookie".to_string())
-	        .unwrap())
+		(StatusCode::UNAUTHORIZED, Box::new(RequestDenial::new(
+		DenialFault::User,
+		"Invalid username or cookie".to_string(),
+String::new(),
+		)))
 
-    }
+    };
+
+	Ok(Response::builder()
+		.status(code)
+		.body(simd_json::to_string(&json_resp).unwrap())
+		.unwrap())
+
 }
 
 pub fn transfer_req() {
 
 }
 
+#[derive(Serialize)]
+struct BalanceReqResp {
+	balance: u64,
+}
+
 pub async fn get_balance(auth_req: AuthorizedReq, auth_db: Tree, money_db: Tree, auth_cookie_db: Tree) -> Result<impl Reply, Rejection> {
     let username_bytes = bincode::serialize(&auth_req.username).unwrap();
 
-    if verify_auth_cookie(&auth_req.username, &auth_req.auth_cookie, &auth_cookie_db) && auth_db.contains_key(&username_bytes).unwrap() {
+    let (code, json_resp): (StatusCode, Box<dyn erased_serde::Serialize>) = if verify_auth_cookie(&auth_req.username, &auth_req.auth_cookie, &auth_cookie_db) && auth_db.contains_key(&username_bytes).unwrap() {
         let financial_info_bytes = money_db.get(&username_bytes).unwrap().unwrap();
         let financial_info: FinancialInfo = bincode::deserialize(&financial_info_bytes).unwrap();
-        let balance = financial_info.get_balance() as f64 / 10_u64.pow(12) as f64;
 
-        Ok(Response::builder() 
-            .status(StatusCode::OK)
-            .body(balance.to_string())
-            .unwrap())
+        (StatusCode::OK, Box::new(BalanceReqResp {
+			balance: financial_info.get_balance()
+
+		}))
 
     } else {
-        Ok(Response::builder() 
-              .status(StatusCode::UNAUTHORIZED)
-              .body("Invalid username or cookie".to_string())
-              .unwrap())
-    }
+		(StatusCode::UNAUTHORIZED, Box::new(RequestDenial::new(
+		DenialFault::User,
+		"Invalid username or cookie".to_string(),
+String::new(),
+		)))
+    };
+
+	Ok(Response::builder()
+		.status(code)
+		.body(simd_json::to_string(json_resp.as_ref()).unwrap())
+		.unwrap())
 }
 
 pub(crate) fn attach_xmr_address(attach_req: AttachXMRAddress, money_db: Tree, auth_db: Tree, auth_cookie_db: Tree) -> Response<String> {
@@ -131,35 +156,44 @@ pub(crate) fn attach_xmr_address(attach_req: AttachXMRAddress, money_db: Tree, a
 
 		let xmr_addr = match Address::from_str(&attach_req.monero_address) {
 			Ok(monero_addr) => monero_addr,
-			Err(_) => return Response::builder()
-		        .status(StatusCode::BAD_REQUEST)
-		        .body("Invalid Monero address".to_string())
-		        .unwrap(),
+			Err(_) => {
+				let resp = RequestDenial::new(
+				DenialFault::User,
+				"Invalid address".to_string(),
+		String::new(),
+				);
+
+				return Response::builder()
+		        	.status(StatusCode::BAD_REQUEST)
+		        	.body(simd_json::to_string(&resp).unwrap())
+		        	.unwrap();
+			},
 		};
 
 		financial_info.xmr_addr = Some(xmr_addr);
 
 		Response::builder()
 	        .status(StatusCode::OK)
-	        .body("Set new address".to_string())
+	        .body(String::new())
 	        .unwrap()
 
 	} else {
+		let resp = RequestDenial::new(
+		DenialFault::User,
+		"Invalid username or cookie".to_string(),
+String::new(),
+		);
+
 		Response::builder()
-	        .status(StatusCode::UNAUTHORIZED)
-	        .body("Invalid username or cookie".to_string())
-	        .unwrap()
+			.status(StatusCode::UNAUTHORIZED)
+			.body(simd_json::to_string(&resp).unwrap())
+			.unwrap()
 
 	}
 }
 
 pub async fn update_cached_fee(cached_fee: Arc<CachedFee>, wallet: &Wallet) {
 	loop {
-		/*let res = tokio::try_join!(
-			wallet.get_fee(),
-			wallet.get_height(),
-		);*/
-
 		let fee = wallet.get_fee().await;
 
 		if let Ok(fee) = fee {
