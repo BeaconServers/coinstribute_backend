@@ -12,6 +12,7 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
+      - run: sudo apt update && sudo apt-get install mold clang lld -y
       - uses: actions/checkout@v2
       - uses: actions-rs/toolchain@v1
         with:
