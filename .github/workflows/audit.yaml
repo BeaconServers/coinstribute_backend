@@ -8,8 +8,9 @@ jobs:
   security_audit:
     runs-on: ubuntu-latest
     steps:
-      - run: sudo apt update && sudo apt-get install mold clang lld -y
       - uses: actions/checkout@v1
+      - run: sudo apt update && sudo apt-get install clang lld -y
+      - run: sed -i -e 's/mold/ld.lld/g' .cargo/config.toml
       - uses: actions-rs/audit-check@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
