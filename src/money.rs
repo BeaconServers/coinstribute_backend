@@ -1,5 +1,6 @@
 use crate::{RequestDenial, DenialFault};
 use crate::auth::verify_auth_cookie;
+use crate::fundraiser::Fundraiser;
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -11,7 +12,7 @@ use sled::Tree;
 
 use rayon::prelude::*;
 
-use monero_wallet::{Address, Wallet, Payment, PaymentId};
+use monero_wallet::{Address, Wallet, PaymentId, Payment};
 
 use warp::{Rejection, Reply};
 use warp::{http::Response, hyper::StatusCode};
@@ -20,13 +21,6 @@ use warp::{http::Response, hyper::StatusCode};
 pub struct AuthorizedReq {
 	username: String,
 	auth_cookie: String,
-}
-
-#[derive(Deserialize)]
-pub struct UserTransfer {
-	username: String,
-	auth_cookie: String,
-	user_to_transfer_to: String,
 }
 
 #[derive(Deserialize)]
@@ -41,8 +35,10 @@ pub(crate) struct FinancialInfo {
 	xmr_addr: Option<Address>,
 	// The amount of monero in piconeros
 	payment_id: [u8; 8],
-	transfers_in: Vec<Payment>,
-	transfers_out: Vec<Transfer>,
+	deposits: Vec<Payment>,
+	active_fundraisers: Vec<Fundraiser>,
+	old_fundraisers: Vec<Fundraiser>,
+	transfers_out: Vec<BlockchainTransfer>,
 }
 
 impl FinancialInfo {
@@ -50,8 +46,10 @@ impl FinancialInfo {
 		let new = Self {
 			xmr_addr: None,
 			payment_id: current_payment_id.fetch_add(1, Ordering::SeqCst).to_be_bytes(),
-			transfers_in: Vec::new(),
+			active_fundraisers: Vec::new(),
+			old_fundraisers: Vec::new(),
 			transfers_out: Vec::new(),
+			deposits: Vec::new(),
 		};
 
 		current_payment_id_db.insert(b"current_id", &current_payment_id.load(Ordering::SeqCst).to_be_bytes()).unwrap();
@@ -63,13 +61,16 @@ impl FinancialInfo {
 
 	/// Adds all the transfers in and transfers out together
 	fn get_balance(&self) -> u64 {
-		let (transfers_in_total, transfers_out_total): (u64, u64) = rayon::join(
-			|| self.transfers_in.par_iter().map(|p| p.amount).sum(),
-			|| self.transfers_out.par_iter().map(|t| t.amt).sum(),
+		let active_fund_total: u64 = self.active_fundraisers.iter().map(|p| p.amt_earned()).sum();
+		let past_fund_total: u64 = self.old_fundraisers.iter().map(|p| p.amt_earned()).sum();
+		let transfers_out_total: u64 = self.transfers_out.iter().map(|p| p.amt).sum();
 
-		);
+		(active_fund_total + past_fund_total).checked_sub(transfers_out_total).unwrap()
 
-		transfers_in_total.checked_sub(transfers_out_total).unwrap()
+	}
+
+	pub fn add_fundraiser(&mut self, fundraiser: Fundraiser) {
+		self.active_fundraisers.push(fundraiser);
 
 	}
 }
@@ -115,10 +116,6 @@ String::new(),
 		.status(code)
 		.body(simd_json::to_string(&json_resp).unwrap())
 		.unwrap())
-
-}
-
-pub fn transfer_req() {
 
 }
 
@@ -247,8 +244,8 @@ pub async fn update_acc_balances(money_db: Tree, wallet: &Wallet) {
 
 					};
 
-					if payments.len() != financial_info.transfers_in.len() {
-						 financial_info.transfers_in = payments.par_iter().filter_map(|payment| {
+					if payments.len() != financial_info.deposits.len() {
+						 financial_info.deposits = payments.par_iter().filter_map(|payment| {
 							match payment.unlock_time == 0 {
 								true => Some(payment),
 								false => None,
@@ -293,7 +290,7 @@ pub async fn update_acc_balances(money_db: Tree, wallet: &Wallet) {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct Transfer {
+pub struct BlockchainTransfer {
 	from: String,
 	block_height: u64,
 	amt: u64,

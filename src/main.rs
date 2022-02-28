@@ -1,4 +1,5 @@
 mod auth;
+mod fundraiser;
 mod money;
 
 use std::convert::Infallible;
@@ -14,6 +15,7 @@ use warp::http::StatusCode;
 
 use auth::*;
 use money::*;
+use fundraiser::*;
 
 static WALLET_RPC_ADDR: Lazy<String> = Lazy::new(|| String::from("http://127.0.0.1:19000"));
 static DAEMON_ADDR: Lazy<String> = Lazy::new(|| String::from("http://node.moneroworld.com:18089"));
@@ -36,7 +38,9 @@ fn main() {
     let auth_db = db.open_tree(b"auth_db").expect("Failed to open authorization tree, time to panic!");
     let cookie_db = db.open_tree(b"cookie_db").expect("Failed to open cookie tree, time to panic!");
     let money_db = db.open_tree(b"money_db").expect("Failed to open money tree, oh no");
+    let fundraiser_db = db.open_tree(b"fundraiser_db").expect("Failed to open fundraiser tree, time to panic!");
     let current_payment_id_db = db.open_tree(b"current_payment_id_db").expect("Failed to initialize the current payment id");
+    let current_fundraiser_id_db = db.open_tree(b"current_fundraiser_id_db").expect("Failed to initialize current fundraiser ID");
 
     let current_payment_id: Arc<AtomicU64> = Arc::new(AtomicU64::new(match current_payment_id_db.get(b"current_id").unwrap() {
         Some(id_bytes) => u64::from_be_bytes({
@@ -51,6 +55,19 @@ fn main() {
         }
     }));
 
+    let current_fundraiser_id: Arc<AtomicU64> = Arc::new(AtomicU64::new(match current_fundraiser_id_db.get(b"current_id").unwrap() {
+        Some(id_bytes) => u64::from_be_bytes({
+            let mut bytes: [u8; 8] = [0; 8];
+            bytes.copy_from_slice(&id_bytes);
+
+            bytes
+        }),
+        None => {
+            current_fundraiser_id_db.insert(b"current_id", &[0; 8]).unwrap();
+            0
+        }
+    }));
+
     let auth_db = warp::any().map(move || auth_db.clone());
     let cookie_db_filter = {
         let cookie_db = cookie_db.clone();
@@ -60,9 +77,12 @@ fn main() {
         let money_db_clone = money_db.clone();
         warp::any().map(move || money_db_clone.clone())
     };
+    let fundraiser_db_filter = warp::any().map(move || fundraiser_db.clone());
     let wallet_filter = warp::any().map(wallet);
     let current_payment_id_filter = warp::any().map(move || current_payment_id.clone());
     let current_payment_id_db_filter = warp::any().map(move || current_payment_id_db.clone());
+    let current_fundraiser_id_filter = warp::any().map(move || current_fundraiser_id.clone());
+    let current_fundraiser_id_db_filter = warp::any().map(move || current_fundraiser_id_db.clone());
     let cached_fee_filter = {
         let cached_fee = cached_fee.clone();
         warp::any().map(move || cached_fee.clone())
@@ -108,10 +128,21 @@ fn main() {
     let attach_xmr_address = warp::path("attach_xmr_address")
         .and(warp::body::content_length_limit(2048))
         .and(warp::body::json())
-        .and(money_db_filter)
+        .and(money_db_filter.clone())
+        .and(auth_db.clone())
+        .and(cookie_db_filter.clone())
+        .map(attach_xmr_address);
+
+    let create_fundraiser = warp::path("create_fundraiser")
+        .and(warp::body::content_length_limit(2048))
+        .and(warp::body::json())
         .and(auth_db)
         .and(cookie_db_filter)
-        .map(attach_xmr_address);
+        .and(fundraiser_db_filter)
+        .and(money_db_filter)
+        .and(current_fundraiser_id_db_filter)
+        .and(current_fundraiser_id_filter)
+        .map(create_fundraiser);
 
     let post_routes = warp::post()
         .and(
@@ -120,6 +151,7 @@ fn main() {
             .or(deposit_req)
             .or(attach_xmr_address)
             .or(get_balance)
+            .or(create_fundraiser)
         );
 
 
@@ -208,8 +240,6 @@ async fn handle_rejection(err: Rejection) -> Result<impl Reply, Infallible> {
 enum DenialFault {
     Server,
     User,
-    ServerAndUser,
-    Unknown,
 }
 
 impl std::fmt::Display for DenialFault {
@@ -217,8 +247,6 @@ impl std::fmt::Display for DenialFault {
         write!(f, "{}", match self {
             DenialFault::Server => "Server",
             DenialFault::User => "User",
-            DenialFault::ServerAndUser => "Server and User",
-            DenialFault::Unknown => "Unknown",
         })
     }
 }
