@@ -9,6 +9,7 @@ overflow-checks = false
 debug = 0
 
 [profile.release]
+strip = true
 opt-level = 3
 overflow-checks = false
 lto = "fat"

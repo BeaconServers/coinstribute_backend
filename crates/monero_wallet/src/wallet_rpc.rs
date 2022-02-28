@@ -88,75 +88,80 @@ impl WalletRPC {
 
 		let response = self.request(&req_body).await?;
 
-		if let Some(payments_json) = response["result"]["payments"].as_array() {
-			let payments: Result<Vec<Payment>, WalletRPCError> = payments_json.par_iter().map(|payment_json| {
-				Ok(Payment {
-			        payment_id: {
-			        	let payment_id_json = &payment_json["payment_id"];
-
-			        	match payment_id_json.as_str() {
-			        		Some(id_str) => {
-			        			let hex_bytes = match hex_simd::decode_to_boxed_bytes(id_str.as_bytes()) {
-			        				Ok(b) => b,
-			        				Err(e) => return Err(WalletRPCError::HexError(e)),
-			        			};
-
-			        			if hex_bytes.len() != 8 {
-			        				return Err(WalletRPCError::InvalidPaymentId)
-			        			}
-
-			        			let mut hex_bytes_array: [u8; 8] = [0; 8];
-			        			hex_bytes_array.copy_from_slice(&hex_bytes);
-
-			        			hex_bytes_array
-
-			        		},
-			        		None => return Err(WalletRPCError::MissingData),
-
-			        	}
-
-			        },
-			        tx_hash: match payment_json["tx_hash"].as_str() {
-			        	Some(tx_hash) => tx_hash.to_string(),
-			        	None => return Err(WalletRPCError::MissingData),
-			        },
-			        amount: match payment_json["amount"].as_u64() {
-			        	Some(amount) => amount,
-			        	None => return Err(WalletRPCError::MissingData),
-			        },
-			        block_height: match payment_json["block_height"].as_u64() {
-			        	Some(block_height) => block_height,
-			        	None => return Err(WalletRPCError::MissingData),
-			        },
-			        unlock_time: match payment_json["unlock_time"].as_u64() {
-			        	Some(unlock_height) => unlock_height,
-			        	None => return Err(WalletRPCError::MissingData),
-			        },
-			        subaddr_index_major: match payment_json["subaddr_index"]["major"].as_u64() {
-			        	Some(index_major) => index_major,
-			        	None => return Err(WalletRPCError::MissingData),
-			        },
-			        subaddr_index_minor: match payment_json["subaddr_index"]["minor"].as_u64() {
-			        	Some(index_minor) => index_minor,
-			        	None => return Err(WalletRPCError::MissingData),
-			        },
-			        recv_addr: {
-			        	match payment_json["address"].as_str() {
-			        		Some(addr) => {
-			        			match Address::from_str(addr) {
-			        				Ok(addr) => addr,
-			        				Err(e) =>return Err(WalletRPCError::AddrError(e)),
-			        			}
-
-			        		},
-			        		None => return Err(WalletRPCError::MissingData),
-			        	}
-			        },
-			    })
-			}).collect();
-
-			payments
-
+		if let Some(result) = response.get("result") {
+			if let Some(payments_json) = result.get("payments").as_array() {
+				let payments: Result<Vec<Payment>, WalletRPCError> = payments_json.par_iter().map(|payment_json| {
+					Ok(Payment {
+						payment_id: {
+							let payment_id_json = &payment_json["payment_id"];
+	
+							match payment_id_json.as_str() {
+								Some(id_str) => {
+									let hex_bytes = match hex_simd::decode_to_boxed_bytes(id_str.as_bytes()) {
+										Ok(b) => b,
+										Err(e) => return Err(WalletRPCError::HexError(e)),
+									};
+	
+									if hex_bytes.len() != 8 {
+										return Err(WalletRPCError::InvalidPaymentId)
+									}
+	
+									let mut hex_bytes_array: [u8; 8] = [0; 8];
+									hex_bytes_array.copy_from_slice(&hex_bytes);
+	
+									hex_bytes_array
+	
+								},
+								None => return Err(WalletRPCError::MissingData),
+	
+							}
+	
+						},
+						tx_hash: match payment_json["tx_hash"].as_str() {
+							Some(tx_hash) => tx_hash.to_string(),
+							None => return Err(WalletRPCError::MissingData),
+						},
+						amount: match payment_json["amount"].as_u64() {
+							Some(amount) => amount,
+							None => return Err(WalletRPCError::MissingData),
+						},
+						block_height: match payment_json["block_height"].as_u64() {
+							Some(block_height) => block_height,
+							None => return Err(WalletRPCError::MissingData),
+						},
+						unlock_time: match payment_json["unlock_time"].as_u64() {
+							Some(unlock_height) => unlock_height,
+							None => return Err(WalletRPCError::MissingData),
+						},
+						subaddr_index_major: match payment_json["subaddr_index"]["major"].as_u64() {
+							Some(index_major) => index_major,
+							None => return Err(WalletRPCError::MissingData),
+						},
+						subaddr_index_minor: match payment_json["subaddr_index"]["minor"].as_u64() {
+							Some(index_minor) => index_minor,
+							None => return Err(WalletRPCError::MissingData),
+						},
+						recv_addr: {
+							match payment_json["address"].as_str() {
+								Some(addr) => {
+									match Address::from_str(addr) {
+										Ok(addr) => addr,
+										Err(e) =>return Err(WalletRPCError::AddrError(e)),
+									}
+	
+								},
+								None => return Err(WalletRPCError::MissingData),
+							}
+						},
+					})
+				}).collect();
+	
+				payments
+	
+			} else {
+				Err(WalletRPCError::MissingData)
+	
+			}
 		} else {
 			Err(WalletRPCError::MissingData)
 

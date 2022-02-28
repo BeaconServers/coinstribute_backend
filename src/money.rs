@@ -46,13 +46,19 @@ pub(crate) struct FinancialInfo {
 }
 
 impl FinancialInfo {
-	pub fn new(current_payment_id: Arc<AtomicU64>) -> Self {
-		Self {
+	pub fn new(current_payment_id: Arc<AtomicU64>, current_payment_id_db: Tree) -> Self {
+		let new = Self {
 			xmr_addr: None,
-			payment_id: current_payment_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst).to_be_bytes(),
+			payment_id: current_payment_id.fetch_add(1, Ordering::SeqCst).to_be_bytes(),
 			transfers_in: Vec::new(),
 			transfers_out: Vec::new(),
-		}
+		};
+
+		current_payment_id_db.insert(b"current_id", &current_payment_id.load(Ordering::SeqCst).to_be_bytes()).unwrap();
+		current_payment_id_db.flush().unwrap();
+
+		new
+
 	}
 
 	/// Adds all the transfers in and transfers out together
@@ -225,6 +231,7 @@ pub async fn update_acc_balances(money_db: Tree, wallet: &Wallet) {
 					);
 
 					let payment_id = PaymentId::from_slice(&financial_info.payment_id);
+
 					let payments = match wallet.get_payments(payment_id).await {
 						Ok(payments) => payments,
 						Err(_err) => {

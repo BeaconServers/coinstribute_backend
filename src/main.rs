@@ -21,6 +21,7 @@ static DAEMON_ADDR: Lazy<String> = Lazy::new(|| String::from("http://node.monero
 static WALLET: OnceCell<Wallet> = OnceCell::new();
 
 fn main() {
+    wallet();
     let tokio_rt = Arc::new(Runtime::new().unwrap());
 
     let db = sled::Config::default()
@@ -29,13 +30,26 @@ fn main() {
         .open()
         .expect("Failed to open database");
 
-    let current_payment_id: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     // Since stuff like the current Monero fee can take a long time to get from the wallet rpc, caching it is wise
     let cached_fee = Arc::new(CachedFee::new());
 
     let auth_db = db.open_tree(b"auth_db").expect("Failed to open authorization tree, time to panic!");
     let cookie_db = db.open_tree(b"cookie_db").expect("Failed to open cookie tree, time to panic!");
     let money_db = db.open_tree(b"money_db").expect("Failed to open money tree, oh no");
+    let current_payment_id_db = db.open_tree(b"current_payment_id_db").expect("Failed to initialize the current payment id");
+
+    let current_payment_id: Arc<AtomicU64> = Arc::new(AtomicU64::new(match current_payment_id_db.get(b"current_id").unwrap() {
+        Some(id_bytes) => u64::from_be_bytes({
+            let mut bytes: [u8; 8] = [0; 8];
+            bytes.copy_from_slice(&id_bytes);
+
+            bytes
+        }),
+        None => {
+            current_payment_id_db.insert(b"current_id", &[0; 8]).unwrap();
+            0
+        }
+    }));
 
     let auth_db = warp::any().map(move || auth_db.clone());
     let cookie_db_filter = {
@@ -48,6 +62,7 @@ fn main() {
     };
     let wallet_filter = warp::any().map(wallet);
     let current_payment_id_filter = warp::any().map(move || current_payment_id.clone());
+    let current_payment_id_db_filter = warp::any().map(move || current_payment_id_db.clone());
     let cached_fee_filter = {
         let cached_fee = cached_fee.clone();
         warp::any().map(move || cached_fee.clone())
@@ -60,6 +75,7 @@ fn main() {
         .and(auth_db.clone())
         .and(money_db_filter.clone())
         .and(cookie_db_filter.clone())
+        .and(current_payment_id_db_filter)
         .and(current_payment_id_filter)
         .and_then(register);
 
@@ -112,6 +128,8 @@ fn main() {
 
         let mut set_settings = false;
 
+        println!("Configuring wallet...");
+
         while !set_settings {
             set_settings = tokio::try_join!(
                 wallet.set_daemon(&DAEMON_ADDR, DAEMON_ADDR.contains("127.0.0.1")),
@@ -119,7 +137,7 @@ fn main() {
             ).is_ok();
         }
 
-        println!("Successfully configured wallet sync");
+        println!("Successfully configured wallet!");
 
     });
     tokio_rt.spawn(update_acc_balances(money_db, wallet()));
@@ -135,7 +153,6 @@ fn wallet() -> &'static Wallet {
         // Is it wasteful to spawn a whole tokio Runtime for a single function? Yes.
         // Should I TODO replace this with futures library? Also yes.
         let tokio_rt = Runtime::new().unwrap();
-
         println!("Initialized wallet");
         tokio_rt.block_on(Wallet::new(WALLET_RPC_ADDR.clone(), DAEMON_ADDR.clone(), None, None))
     })

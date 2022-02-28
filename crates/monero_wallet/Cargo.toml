@@ -16,7 +16,5 @@ rayon = { version = "1" }
 reqwest = { version = "0.11", default-features = false, features = ["json"] }
 # A fast JSON parser that uses SIMD instructions (faster than serde_json)
 simd-json = { version = "0.4", features = ["serde"] }
-# Helpful for async stuff
-futures = { version = "0.3", default-features = false, features = ["async-await"] }
 # Serialization
 serde = { version = "1" }

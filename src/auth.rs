@@ -107,7 +107,7 @@ impl From<bincode::Error> for GenAuthCookieErr {
     }
 }
 
-pub(crate) async fn register(user_info: AuthRequest, auth_db: Tree, money_db: Tree, auth_cookie_db: Tree, current_payment_id: Arc<AtomicU64>) -> Result<impl Reply, Rejection> {
+pub(crate) async fn register(user_info: AuthRequest, auth_db: Tree, money_db: Tree, auth_cookie_db: Tree, current_payment_id_db: Tree, current_payment_id: Arc<AtomicU64>) -> Result<impl Reply, Rejection> {
     let username = user_info.username;
     let password = user_info.password;
 
@@ -162,7 +162,7 @@ pub(crate) async fn register(user_info: AuthRequest, auth_db: Tree, money_db: Tr
             let user_bytes = bincode::serialize(&user).unwrap();
 
             auth_db.insert(&username_bytes, user_bytes).unwrap();
-            money_db.insert(&username_bytes, bincode::serialize(&FinancialInfo::new(current_payment_id)).unwrap()).unwrap();
+            money_db.insert(&username_bytes, bincode::serialize(&FinancialInfo::new(current_payment_id, current_payment_id_db)).unwrap()).unwrap();
 
             let cookie = generate_auth_cookie(&user.username, &auth_db, auth_cookie_db);
 
@@ -288,7 +288,7 @@ fn auth_cookie_result_to_response(username: String, auth_cookie: Result<AuthCook
                 Box::new(RequestDenial::new(
             DenialFault::Server,
             "Internal Server Error".to_string(),
-    "".to_string(),
+    String::new(),
                 ))
             },
 		}
