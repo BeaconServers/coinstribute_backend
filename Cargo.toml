@@ -30,7 +30,7 @@ once_cell = { version = "1" }
 # Very fast HTTP server library
 warp = { version = "0.3", default-features = false }
 # Very fast database library
-sled = { version = "0.34", features = ["miri_optimizations", "io_uring"] }
+sled = { version = "0.34", features = ["miri_optimizations"] }
 # Multi-threaded async runtime
 tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread"] }
 # A very secure hashing library
