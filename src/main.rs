@@ -68,16 +68,16 @@ fn main() {
         }
     }));
 
-    let auth_db = warp::any().map(move || auth_db.clone());
+    let auth_db = warp::any().map(move || AuthDB(auth_db.clone()));
     let cookie_db_filter = {
         let cookie_db = cookie_db.clone();
-        warp::any().map(move || cookie_db.clone())
+        warp::any().map(move || CookieDB(cookie_db.clone()))
     }; 
     let money_db_filter = {
         let money_db_clone = money_db.clone();
-        warp::any().map(move || money_db_clone.clone())
+        warp::any().map(move || MoneyDB(money_db_clone.clone()))
     };
-    let fundraiser_db_filter = warp::any().map(move || fundraiser_db.clone());
+    let fundraiser_db_filter = warp::any().map(move || FundraiserDB(fundraiser_db.clone()));
     let wallet_filter = warp::any().map(wallet);
     let current_payment_id_filter = warp::any().map(move || current_payment_id.clone());
     let current_payment_id_db_filter = warp::any().map(move || current_payment_id_db.clone());
@@ -138,11 +138,17 @@ fn main() {
         .and(warp::body::json())
         .and(auth_db)
         .and(cookie_db_filter)
-        .and(fundraiser_db_filter)
+        .and(fundraiser_db_filter.clone())
         .and(money_db_filter)
         .and(current_fundraiser_id_db_filter)
         .and(current_fundraiser_id_filter)
         .map(create_fundraiser);
+
+    let search_fundraisers = warp::path("search_fundraisers")
+        .and(warp::body::content_length_limit(2048))
+        .and(warp::body::json())
+        .and(fundraiser_db_filter)
+        .map(search_fundraisers);
 
     let post_routes = warp::post()
         .and(
@@ -152,6 +158,7 @@ fn main() {
             .or(attach_xmr_address)
             .or(get_balance)
             .or(create_fundraiser)
+            .or(search_fundraisers)
         );
 
 
@@ -265,5 +272,46 @@ impl RequestDenial {
             reason,
             additional_info,
         }
+    }
+}
+
+use sled::Tree;
+
+pub struct AuthDB(pub Tree);
+pub struct CookieDB(pub Tree);
+pub struct MoneyDB(pub Tree);
+pub struct FundraiserDB(pub Tree);
+
+
+
+impl std::ops::Deref for AuthDB {
+    type Target = Tree;
+
+    fn deref(&self) -> &Tree {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for CookieDB {
+    type Target = Tree;
+
+    fn deref(&self) -> &Tree {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for MoneyDB {
+    type Target = Tree;
+
+    fn deref(&self) -> &Tree {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for FundraiserDB {
+    type Target = Tree;
+
+    fn deref(&self) -> &Tree {
+        &self.0
     }
 }

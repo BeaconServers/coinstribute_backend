@@ -1,4 +1,4 @@
-use crate::{RequestDenial, DenialFault};
+use crate::{AuthDB, CookieDB, MoneyDB, RequestDenial, DenialFault};
 use crate::auth::verify_auth_cookie;
 use crate::fundraiser::Fundraiser;
 
@@ -52,7 +52,7 @@ impl FinancialInfo {
 			deposits: Vec::new(),
 		};
 
-		current_payment_id_db.insert(b"current_id", &current_payment_id.load(Ordering::SeqCst).to_be_bytes()).unwrap();
+		current_payment_id_db.insert(b"current_id", &(u64::from_be_bytes(new.payment_id) + 1).to_be_bytes()).unwrap();
 		current_payment_id_db.flush().unwrap();
 
 		new
@@ -61,17 +61,23 @@ impl FinancialInfo {
 
 	/// Adds all the transfers in and transfers out together
 	fn get_balance(&self) -> u64 {
-		let active_fund_total: u64 = self.active_fundraisers.iter().map(|p| p.amt_earned()).sum();
-		let past_fund_total: u64 = self.old_fundraisers.iter().map(|p| p.amt_earned()).sum();
+		let active_fund_total: u64 = self.active_fundraisers.iter().map(|f| f.amt_earned()).sum();
+		let past_fund_total: u64 = self.old_fundraisers.iter().map(|f| f.amt_earned()).sum();
+		let deposits_total: u64 = self.deposits.iter().map(|p| p.amount).sum(); 
+
 		let transfers_out_total: u64 = self.transfers_out.iter().map(|p| p.amt).sum();
 
-		(active_fund_total + past_fund_total).checked_sub(transfers_out_total).unwrap()
+		(active_fund_total + deposits_total + past_fund_total).checked_sub(transfers_out_total).unwrap()
 
 	}
 
 	pub fn add_fundraiser(&mut self, fundraiser: Fundraiser) {
 		self.active_fundraisers.push(fundraiser);
 
+	}
+
+	pub fn active_fundraisers(&self) -> &Vec<Fundraiser> {
+		&self.active_fundraisers
 	}
 }
 
@@ -81,7 +87,7 @@ struct DepositReqResp {
 	min_amt: u64,
 }
 
-pub(crate) async fn deposit_req(invoice_req: AuthorizedReq, auth_db: Tree, auth_cookie_db: Tree, money_db: Tree, wallet: &Wallet, cached_fee: Arc<CachedFee>) -> Result<impl Reply, Rejection> {
+pub(crate) async fn deposit_req(invoice_req: AuthorizedReq, auth_db: AuthDB, auth_cookie_db: CookieDB, money_db: MoneyDB, wallet: &Wallet, cached_fee: Arc<CachedFee>) -> Result<impl Reply, Rejection> {
 	let invoice_req_username_bytes = bincode::serialize(&invoice_req.username).unwrap();
 
 	let (code, json_resp): (StatusCode, Box<dyn erased_serde::Serialize + Send>) = if verify_auth_cookie(&invoice_req.username, &invoice_req.auth_cookie, &auth_cookie_db) && auth_db.contains_key(invoice_req_username_bytes).unwrap() {
@@ -124,7 +130,7 @@ struct BalanceReqResp {
 	balance: u64,
 }
 
-pub async fn get_balance(auth_req: AuthorizedReq, auth_db: Tree, money_db: Tree, auth_cookie_db: Tree) -> Result<impl Reply, Rejection> {
+pub async fn get_balance(auth_req: AuthorizedReq, auth_db: AuthDB, money_db: MoneyDB, auth_cookie_db: CookieDB) -> Result<impl Reply, Rejection> {
     let username_bytes = bincode::serialize(&auth_req.username).unwrap();
 
     let (code, json_resp): (StatusCode, Box<dyn erased_serde::Serialize>) = if verify_auth_cookie(&auth_req.username, &auth_req.auth_cookie, &auth_cookie_db) && auth_db.contains_key(&username_bytes).unwrap() {
@@ -150,7 +156,7 @@ String::new(),
 		.unwrap())
 }
 
-pub(crate) fn attach_xmr_address(attach_req: AttachXMRAddress, money_db: Tree, auth_db: Tree, auth_cookie_db: Tree) -> Response<String> {
+pub(crate) fn attach_xmr_address(attach_req: AttachXMRAddress, money_db: MoneyDB, auth_db: AuthDB, auth_cookie_db: CookieDB) -> Response<String> {
 	let username_bytes = bincode::serialize(&attach_req.username).unwrap();
 
 	if auth_db.contains_key(&username_bytes).unwrap() && verify_auth_cookie(&attach_req.username, &attach_req.auth_cookie, &auth_cookie_db) {

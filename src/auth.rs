@@ -1,3 +1,5 @@
+use crate::{AuthDB, CookieDB, MoneyDB};
+
 use std::fmt::Display;
 use std::time::{SystemTime, Duration};
 use std::sync::Arc;
@@ -107,7 +109,7 @@ impl From<bincode::Error> for GenAuthCookieErr {
     }
 }
 
-pub(crate) async fn register(user_info: AuthRequest, auth_db: Tree, money_db: Tree, auth_cookie_db: Tree, current_payment_id_db: Tree, current_payment_id: Arc<AtomicU64>) -> Result<impl Reply, Rejection> {
+pub(crate) async fn register(user_info: AuthRequest, auth_db: AuthDB, money_db: MoneyDB, auth_cookie_db: CookieDB, current_payment_id_db: Tree, current_payment_id: Arc<AtomicU64>) -> Result<impl Reply, Rejection> {
     let username = user_info.username;
     let password = user_info.password;
 
@@ -164,7 +166,7 @@ pub(crate) async fn register(user_info: AuthRequest, auth_db: Tree, money_db: Tr
             auth_db.insert(&username_bytes, user_bytes).unwrap();
             money_db.insert(&username_bytes, bincode::serialize(&FinancialInfo::new(current_payment_id, current_payment_id_db)).unwrap()).unwrap();
 
-            let cookie = generate_auth_cookie(&user.username, &auth_db, auth_cookie_db);
+            let cookie = generate_auth_cookie(&user.username, &auth_db, auth_cookie_db.clone());
 
             auth_cookie_result_to_response(user.username, cookie)
 
@@ -174,7 +176,7 @@ pub(crate) async fn register(user_info: AuthRequest, auth_db: Tree, money_db: Tr
 
     let (res, _) = tokio::join!(
         tokio::task::spawn_blocking(get_response),
-        tokio::time::sleep(Duration::from_millis(800)),
+        tokio::time::sleep(Duration::from_millis(650)),
     );
 
     let (code, json) = res.unwrap();
@@ -186,7 +188,7 @@ pub(crate) async fn register(user_info: AuthRequest, auth_db: Tree, money_db: Tr
 
 }
 
-pub(crate) async fn login(user_info: AuthRequest, auth_db: Tree, auth_cookie_db: Tree) -> Result<impl Reply, Rejection> {
+pub(crate) async fn login(user_info: AuthRequest, auth_db: AuthDB, auth_cookie_db: CookieDB) -> Result<impl Reply, Rejection> {
     let username = user_info.username;
     let password = user_info.password;
 
@@ -203,7 +205,7 @@ String::new(),
             match argon2::verify_raw(password.as_bytes(), &user_info.salt, &user_info.hashed_password, &ARGON2_CONFIG).unwrap() {
                 // Login successful
                 true => {
-                	let auth_cookie = generate_auth_cookie(&username, &auth_db, auth_cookie_db);
+                	let auth_cookie = generate_auth_cookie(&username, &auth_db, auth_cookie_db.clone());
                 	auth_cookie_result_to_response(username, auth_cookie)
 
                 },
@@ -217,7 +219,7 @@ String::new(),
 
     let (res, _) = tokio::join!(
         tokio::task::spawn_blocking(give_response),
-        tokio::time::sleep(Duration::from_millis(800)),
+        tokio::time::sleep(Duration::from_millis(4500)),
     );
 
     let (code, json) = res.unwrap();
