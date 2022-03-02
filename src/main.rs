@@ -88,6 +88,11 @@ fn main() {
         warp::any().map(move || cached_fee.clone())
     };
 
+    let cors = warp::cors()
+        .allow_any_origin()
+        .allow_methods(["POST", "GET", "PUT", "HEAD", "DELETE", "OPTIONS", "CONNECT", "PATCH", "TRACE"])
+        .allow_headers(["Content-Type"]);
+
     let register = warp::path("signup")
         // 2 KB limit to username + password
         .and(warp::body::content_length_limit(2048))
@@ -183,7 +188,7 @@ fn main() {
     tokio_rt.spawn(update_cached_fee(cached_fee, wallet()));
     tokio_rt.spawn_blocking(move || destroy_expired_auth_cookies(cookie_db));
 
-    tokio_rt.block_on(warp::serve(post_routes.recover(handle_rejection)).run(([127, 0, 0, 1], 3030)));
+    tokio_rt.block_on(warp::serve(post_routes.with(cors).recover(handle_rejection)).run(([127, 0, 0, 1], 3030)));
 
 }
 
