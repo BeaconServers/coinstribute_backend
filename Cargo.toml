@@ -42,8 +42,9 @@ rayon = { version = "1" }
 # It's serde
 serde_derive = { version = "1" }
 serde = { version = "1" }
-erased-serde = { version = "0.3" }
 # Very fast JSON Serialization/Deserialization
-simd-json = { version = "0.4", features = ["serde"]}
+simd-json = { version = "0.4", features = ["serde"] }
+# Faster Mutex then std's
+parking_lot = { version = "0.12", features = ["send_guard"] }
 # Library written by a cool guy for dealing with Monero wallet RPC
 monero_wallet = { path = "crates/monero_wallet" }

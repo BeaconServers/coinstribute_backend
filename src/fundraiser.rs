@@ -1,18 +1,17 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{AuthDB, CookieDB, DenialFault, RequestDenial, FundraiserDB, MoneyDB};
-use crate::money::FinancialInfo;
+use crate::{DenialFault, RequestDenial};
+use crate::db::{AuthDB, CookieDB, FundraiserDB, MoneyDB, DB, CurrentFundraiserIdDB};
 use crate::auth::verify_auth_cookie;
 
 use rayon::prelude::*;
 use serde_derive::{Serialize, Deserialize};
-use sled::Tree;
 
 use warp::http::Response;
 use warp::hyper::StatusCode;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct InternalTransfer {
     origin: String,
     receiver_fundraiser: u64,
@@ -29,7 +28,7 @@ pub struct CreateFundraiserReq {
     goal: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Fundraiser {
     name: String,
     owner: String,
@@ -44,27 +43,23 @@ impl Fundraiser {
         self.payments.iter().map(|p| p.amt).sum()
     }
 
-    fn from_req(req: CreateFundraiserReq, current_fundraiser_id: Arc<AtomicU64>) -> Self {
+    fn from_req(req: &CreateFundraiserReq, current_fundraiser_id: Arc<AtomicU64>) -> Self {
         Self {
-            name: req.fundraiser_name,
-            owner: req.username,
+            name: req.fundraiser_name.clone(),
+            owner: req.username.clone(),
             fundraiser_id: current_fundraiser_id.fetch_add(1, Ordering::SeqCst),
             goal: req.goal,
-            purpose: req.purpose,
+            purpose: req.purpose.clone(),
             payments: Vec::new(),
         }
     }
 }
 
-pub fn create_fundraiser(create_fund_req: CreateFundraiserReq, auth_db: AuthDB, auth_cookie_db: CookieDB, fundraiser_db: FundraiserDB, money_db: MoneyDB, current_fundraiser_id_db: Tree, current_fundraiser_id: Arc<AtomicU64>) -> Response<String> {
-    let username_bytes = bincode::serialize(&create_fund_req.username).unwrap();
+pub fn create_fundraiser(create_fund_req: CreateFundraiserReq, auth_db: AuthDB, auth_cookie_db: CookieDB, fundraiser_db: FundraiserDB, money_db: MoneyDB, current_fundraiser_id_db: CurrentFundraiserIdDB, current_fundraiser_id: Arc<AtomicU64>) -> Response<String> {
+    if auth_db.contains_key(&create_fund_req.username).unwrap() && verify_auth_cookie(&create_fund_req.username, &create_fund_req.auth_cookie, &auth_cookie_db) {
+        let fundraiser = Fundraiser::from_req(&create_fund_req, current_fundraiser_id);
 
-    if auth_db.contains_key(&username_bytes).unwrap() && verify_auth_cookie(&create_fund_req.username, &create_fund_req.auth_cookie, &auth_cookie_db) {
-        let fundraiser = Fundraiser::from_req(create_fund_req, current_fundraiser_id);
-
-        let fundraiser_name_bytes = bincode::serialize(&fundraiser.name.to_lowercase()).unwrap();
-
-        if fundraiser_db.contains_key(&fundraiser_name_bytes).unwrap() {
+        if fundraiser_db.contains_key(&fundraiser.name).unwrap() {
             let denial = RequestDenial::new(DenialFault::User, String::from("The given fundraiser name already exists"), String::from("Please pick a different name for your fundraiser"));
             let json = simd_json::to_string(&denial).unwrap();
 
@@ -74,8 +69,7 @@ pub fn create_fundraiser(create_fund_req: CreateFundraiserReq, auth_db: AuthDB, 
                 .unwrap()
 
         } else {
-            let financial_info_bytes = money_db.get(&username_bytes).unwrap().unwrap();
-            let mut financial_info: FinancialInfo = bincode::deserialize(&financial_info_bytes).unwrap();
+            let mut financial_info = money_db.get(&create_fund_req.username).unwrap().unwrap();
 
             if financial_info.active_fundraisers().len() >= 5 {
                 let denial = RequestDenial::new(
@@ -93,16 +87,15 @@ pub fn create_fundraiser(create_fund_req: CreateFundraiserReq, auth_db: AuthDB, 
 
             } else {
                 let fundraiser_json = simd_json::to_string(&fundraiser).unwrap();
-                let fundraiser_bytes = bincode::serialize(&fundraiser).unwrap();
 
-                fundraiser_db.insert(&fundraiser_name_bytes, fundraiser_bytes).unwrap();
+                fundraiser_db.insert(&fundraiser.name, &fundraiser).unwrap();
 
-                current_fundraiser_id_db.insert(b"current_id", &(fundraiser.fundraiser_id + 1).to_be_bytes()).unwrap();
+                current_fundraiser_id_db.insert(&"current_id".to_string(), &(fundraiser.fundraiser_id + 1)).unwrap();
                 current_fundraiser_id_db.flush().unwrap();
 
                 financial_info.add_fundraiser(fundraiser);
 
-                money_db.insert(&username_bytes, bincode::serialize(&financial_info).unwrap()).unwrap();
+                money_db.insert(&create_fund_req.username, &financial_info).unwrap();
 
                 Response::builder()
                     .status(StatusCode::OK)
@@ -165,9 +158,9 @@ pub fn search_fundraisers(search_req: SearchFundraisersReq, fundraiser_db: Fundr
 
     if search_req.max_num_results > 100 {
         let denial = RequestDenial::new(
-        DenialFault::User, 
-        String::from("We can only send a maximum of 100 results at a time"),
-String::from("Please request a lower number"),
+            DenialFault::User, 
+            String::from("We can only return a maximum of 100 results at a time"),
+            String::from("Please request a lower number"),
         );
 
         let json = simd_json::to_string(&denial).unwrap();
@@ -188,13 +181,7 @@ String::from("Please request a lower number"),
 
         }
 
-        let (fundraiser_name_lowercase, fundraiser): (String, Fundraiser) = {
-            let (name_lowercase_bytes, fundraiser) = res.unwrap();
-
-            (bincode::deserialize(&name_lowercase_bytes).unwrap(), bincode::deserialize(&fundraiser).unwrap())
-
-        };
-
+        let (fundraiser_name_lowercase, fundraiser) = res.unwrap();
 
         if fundraiser_name_lowercase.contains(&query_lowercase) || fundraiser.purpose.to_lowercase().contains(&query_lowercase) || fundraiser.owner.to_lowercase().contains(&query_lowercase) {
             results.push(fundraiser.into());

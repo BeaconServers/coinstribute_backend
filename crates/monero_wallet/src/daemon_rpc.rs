@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 // Some code is taken from https://github.com/busyboredom/acceptxmr/blob/v0.10.1/src/rpc.rs for the daemon_rpc.rs module, so the below copyright is included.
 /*
 Copyright (c) 2021 AcceptXMR Contributors
@@ -29,7 +30,7 @@ DEALINGS IN THE SOFTWARE.
 
 use std::time::Duration;
 
-use hashbrown::{HashMap, HashSet};
+use hashbrown::HashSet;
 use hex_simd::AsciiCase;
 use rayon::prelude::*;
 use reqwest::{Client, ClientBuilder, Method};

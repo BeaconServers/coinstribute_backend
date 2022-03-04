@@ -1,5 +1,6 @@
-use crate::{AuthDB, CookieDB, MoneyDB, RequestDenial, DenialFault};
+use crate::{RequestDenial, DenialFault};
 use crate::auth::verify_auth_cookie;
+use crate::db::{AuthDB, CookieDB, MoneyDB, DB};
 use crate::fundraiser::Fundraiser;
 
 use std::str::FromStr;
@@ -8,11 +9,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::{Serialize, Deserialize};
-use sled::Tree;
-
-use rayon::prelude::*;
-
-use monero_wallet::{Address, Wallet, PaymentId, Payment};
+use monero_wallet::{Address, Wallet, Transfers};
+use parking_lot::Mutex;
+use tokio::sync::RwLock;
+use tokio::sync::mpsc::{UnboundedSender, UnboundedReceiver};
 
 use warp::{Rejection, Reply};
 use warp::{http::Response, hyper::StatusCode};
@@ -30,44 +30,51 @@ pub(crate) struct AttachXMRAddress {
 	monero_address: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct FinancialInfo {
 	xmr_addr: Option<Address>,
-	// The amount of monero in piconeros
-	payment_id: [u8; 8],
-	deposits: Vec<Payment>,
-	active_fundraisers: Vec<Fundraiser>,
+	deposit_addr: Address,
+	transfers: Transfers,
+	balance: u64,
+    active_fundraisers: Vec<Fundraiser>,
 	old_fundraisers: Vec<Fundraiser>,
-	transfers_out: Vec<BlockchainTransfer>,
+	service_fee_total: u64,
 }
 
 impl FinancialInfo {
-	pub fn new(current_payment_id: Arc<AtomicU64>, current_payment_id_db: Tree) -> Self {
-		let new = Self {
+	pub fn new(addr_index: u64, deposit_addr: Address) -> Self {
+		Self {
 			xmr_addr: None,
-			payment_id: current_payment_id.fetch_add(1, Ordering::SeqCst).to_be_bytes(),
+			deposit_addr,
 			active_fundraisers: Vec::new(),
 			old_fundraisers: Vec::new(),
-			transfers_out: Vec::new(),
-			deposits: Vec::new(),
-		};
-
-		current_payment_id_db.insert(b"current_id", &(u64::from_be_bytes(new.payment_id) + 1).to_be_bytes()).unwrap();
-		current_payment_id_db.flush().unwrap();
-
-		new
-
+		    balance: 0,
+		    service_fee_total: 0,
+            transfers: Transfers {
+				addr_index,
+				transfers_in: Vec::new(),
+				transfers_out: Vec::new(),
+			},
+		}
 	}
 
 	/// Adds all the transfers in and transfers out together
 	fn get_balance(&self) -> u64 {
 		let active_fund_total: u64 = self.active_fundraisers.iter().map(|f| f.amt_earned()).sum();
 		let past_fund_total: u64 = self.old_fundraisers.iter().map(|f| f.amt_earned()).sum();
-		let deposits_total: u64 = self.deposits.iter().map(|p| p.amount).sum(); 
+		// Using an algabraic proof that I calculated then simplified a ton, we know that service_fee is equal to:
+		//  (amt_sent + network_fee) / 49
+		// We know this because service_fee = (2 * orig_amt) / 100 and we know that t.amount = orig_amt - service_fee - net_fee
+		// Using some algebra, we can solve for service_fee (this is for if Susorodni wants to check my math on this lol)
+		// We will just use the max of this calculatin and the self.service_fee_total, since calculating the service fee will lag behind slightly while we wait for thee monero rpc to catch up
+		let transfer_out_service_fee_total: u64 = self.transfers.transfers_out.iter().map(|t| (t.amount + t.fee) / 49).sum();
 
-		let transfers_out_total: u64 = self.transfers_out.iter().map(|p| p.amt).sum();
+		if transfer_out_service_fee_total != self.service_fee_total {
+			eprintln!("Calced fee: {transfer_out_service_fee_total} vs self_fee: {}", self.service_fee_total);
 
-		(active_fund_total + deposits_total + past_fund_total).checked_sub(transfers_out_total).unwrap()
+		}
+		
+		active_fund_total + past_fund_total + self.balance - (self.service_fee_total.max(transfer_out_service_fee_total))
 
 	}
 
@@ -88,40 +95,33 @@ struct DepositReqResp {
 }
 
 pub(crate) async fn deposit_req(invoice_req: AuthorizedReq, auth_db: AuthDB, auth_cookie_db: CookieDB, money_db: MoneyDB, wallet: &Wallet, cached_fee: Arc<CachedFee>) -> Result<impl Reply, Rejection> {
-	let invoice_req_username_bytes = bincode::serialize(&invoice_req.username).unwrap();
-
-	let (code, json_resp): (StatusCode, Box<dyn erased_serde::Serialize + Send>) = if verify_auth_cookie(&invoice_req.username, &invoice_req.auth_cookie, &auth_cookie_db) && auth_db.contains_key(invoice_req_username_bytes).unwrap() {
-		let username = &invoice_req.username;
-
-		let payment_id = {
-			let financial_info_bytes = money_db.get(bincode::serialize(username).unwrap()).unwrap().unwrap();
-			let financial_info: FinancialInfo = bincode::deserialize(&financial_info_bytes).unwrap();
-
-			PaymentId::from_slice(&financial_info.payment_id)
-		};
-
-		let addr = wallet.new_integrated_addr(payment_id);
+	if verify_auth_cookie(&invoice_req.username, &invoice_req.auth_cookie, &auth_cookie_db) && auth_db.contains_key(&invoice_req.username).unwrap() {
         let fee = cached_fee.get_fee(wallet).await;
 
+        let financial_info = money_db.get(&invoice_req.username).unwrap().unwrap();
 
-		(StatusCode::OK, Box::new(DepositReqResp {
-			addr: addr.to_string(),
-			min_amt: fee * 10,
-		}))
+        let resp = DepositReqResp {
+			addr: financial_info.deposit_addr.to_string(),
+			min_amt: fee * 5,
+		};
+
+		let json = simd_json::to_string(&resp).unwrap();
+
+		Ok(Response::builder()
+			.status(StatusCode::OK)
+			.body(json)
+			.unwrap())
 
     } else {
-		(StatusCode::UNAUTHORIZED, Box::new(RequestDenial::new(
-		DenialFault::User,
-		"Invalid username or cookie".to_string(),
-String::new(),
-		)))
+		let denial = RequestDenial::new(
+			DenialFault::User,
+			"Invalid username or cookie".to_string(),
+			String::new(),
+		);
 
-    };
+		Ok(denial.into_response(StatusCode::UNAUTHORIZED))
 
-	Ok(Response::builder()
-		.status(code)
-		.body(simd_json::to_string(&json_resp).unwrap())
-		.unwrap())
+    }
 
 }
 
@@ -131,55 +131,55 @@ struct BalanceReqResp {
 }
 
 pub async fn get_balance(auth_req: AuthorizedReq, auth_db: AuthDB, money_db: MoneyDB, auth_cookie_db: CookieDB) -> Result<impl Reply, Rejection> {
-    let username_bytes = bincode::serialize(&auth_req.username).unwrap();
+    if verify_auth_cookie(&auth_req.username, &auth_req.auth_cookie, &auth_cookie_db) && auth_db.contains_key(&auth_req.username).unwrap() {
+        let financial_info = money_db.get(&auth_req.username).unwrap().unwrap();
 
-    let (code, json_resp): (StatusCode, Box<dyn erased_serde::Serialize>) = if verify_auth_cookie(&auth_req.username, &auth_req.auth_cookie, &auth_cookie_db) && auth_db.contains_key(&username_bytes).unwrap() {
-        let financial_info_bytes = money_db.get(&username_bytes).unwrap().unwrap();
-        let financial_info: FinancialInfo = bincode::deserialize(&financial_info_bytes).unwrap();
+        let resp = BalanceReqResp {
+			balance: financial_info.get_balance(),
+		};
 
-        (StatusCode::OK, Box::new(BalanceReqResp {
-			balance: financial_info.get_balance()
+		let json = simd_json::to_string(&resp).unwrap();
 
-		}))
+		Ok(
+			Response::builder()
+				.status(StatusCode::OK)
+				.body(json)
+				.unwrap()
+		)
 
     } else {
-		(StatusCode::UNAUTHORIZED, Box::new(RequestDenial::new(
-		DenialFault::User,
-		"Invalid username or cookie".to_string(),
-String::new(),
-		)))
-    };
+    	let denial = RequestDenial::new(
+    		DenialFault::User,
+    		"Invalid username or cookie".to_string(),
+    		String::new(),
+    	);
 
-	Ok(Response::builder()
-		.status(code)
-		.body(simd_json::to_string(json_resp.as_ref()).unwrap())
-		.unwrap())
+    	Ok(denial.into_response(StatusCode::UNAUTHORIZED))
+
+    }
+
 }
 
 pub(crate) fn attach_xmr_address(attach_req: AttachXMRAddress, money_db: MoneyDB, auth_db: AuthDB, auth_cookie_db: CookieDB) -> Response<String> {
-	let username_bytes = bincode::serialize(&attach_req.username).unwrap();
-
-	if auth_db.contains_key(&username_bytes).unwrap() && verify_auth_cookie(&attach_req.username, &attach_req.auth_cookie, &auth_cookie_db) {
-		let financial_info_bytes = money_db.get(&username_bytes).unwrap().unwrap();
-		let mut financial_info: FinancialInfo = bincode::deserialize(&financial_info_bytes).unwrap();
+	if auth_db.contains_key(&attach_req.username).unwrap() && verify_auth_cookie(&attach_req.username, &attach_req.auth_cookie, &auth_cookie_db) {
+		let mut financial_info = money_db.get(&attach_req.username).unwrap().unwrap();
 
 		let xmr_addr = match Address::from_str(&attach_req.monero_address) {
 			Ok(monero_addr) => monero_addr,
 			Err(_) => {
 				let resp = RequestDenial::new(
-				DenialFault::User,
-				"Invalid address".to_string(),
-		String::new(),
+					DenialFault::User,
+					"Invalid address".to_string(),
+					String::new(),
 				);
 
-				return Response::builder()
-		        	.status(StatusCode::BAD_REQUEST)
-		        	.body(simd_json::to_string(&resp).unwrap())
-		        	.unwrap();
+				return resp.into_response(StatusCode::BAD_REQUEST);
 			},
 		};
 
 		financial_info.xmr_addr = Some(xmr_addr);
+
+		money_db.insert(&attach_req.username, &financial_info).unwrap();
 
 		Response::builder()
 	        .status(StatusCode::OK)
@@ -188,17 +188,143 @@ pub(crate) fn attach_xmr_address(attach_req: AttachXMRAddress, money_db: MoneyDB
 
 	} else {
 		let resp = RequestDenial::new(
-		DenialFault::User,
-		"Invalid username or cookie".to_string(),
-String::new(),
+			DenialFault::User,
+			"Invalid username or cookie".to_string(),
+			String::new(),
 		);
 
-		Response::builder()
-			.status(StatusCode::UNAUTHORIZED)
-			.body(simd_json::to_string(&resp).unwrap())
-			.unwrap()
+		resp.into_response(StatusCode::UNAUTHORIZED)
 
 	}
+}
+
+// TODO: Actually secure this
+pub async fn server_profits(auth_req: AuthorizedReq, money_db: MoneyDB) -> Result<impl Reply, Rejection> {
+	if &auth_req.username == "billy" && &auth_req.auth_cookie == "bobby" {
+		let wallet_balance = crate::wallet().get_balance(&[]).await.unwrap().balance;
+
+		let user_total_balance: u64 = money_db.iter().map(|res| {
+			let (_, financial_info) = res.unwrap();
+			financial_info.get_balance()
+		}).sum();
+
+		println!("{}", wallet_balance - user_total_balance);
+
+	}
+
+	Ok(String::new())
+}
+
+#[derive(Deserialize)]
+pub struct WithdrawMoneroReq {
+	username: String,
+	auth_cookie: String,
+	amt: u64,
+}
+
+#[derive(Serialize)]
+pub struct WithdrawMoneroResp {
+	amt_sent_after_fee: u64,
+	fee_taken: u64,
+}
+
+pub async fn withdraw_monero(withdraw_req: WithdrawMoneroReq, auth_db: AuthDB, cookie_db: CookieDB, money_db: MoneyDB, cached_fee: Arc<CachedFee>, monero_tx_send: UnboundedSender<TransferReq>) -> Result<impl Reply, Rejection> {
+	if auth_db.contains_key(&withdraw_req.username).unwrap() && verify_auth_cookie(&withdraw_req.username, &withdraw_req.auth_cookie, &cookie_db) {
+		let wallet = crate::wallet();
+
+		let net_fee = cached_fee.get_uptodate_fee(wallet).await;
+		if net_fee.is_none() {
+            let denial = RequestDenial::new(DenialFault::Server, String::from("Could not get Monero fee"), String::new());
+            return Ok(denial.into_response(StatusCode::INTERNAL_SERVER_ERROR));
+        }
+        let net_fee = net_fee.unwrap();
+
+        let min_amt = net_fee * 5;
+
+		if withdraw_req.amt >= min_amt {
+			let financial_info = match money_db.get(&withdraw_req.username).unwrap() {
+				Some(financial_info) => financial_info,
+				None => {
+					let denial = RequestDenial::new(DenialFault::User, String::from("Invalid username or cookie"), String::new());
+					return Ok(denial.into_response(StatusCode::UNAUTHORIZED));
+				},
+			};
+
+			let service_fee = 2 * (withdraw_req.amt / 100);
+			let user_balance = financial_info.get_balance();
+
+			if user_balance >= min_amt {
+				let amt_to_send_after_fees = match (withdraw_req.amt).checked_sub(net_fee + service_fee) {
+					Some(amt) => amt,
+					None => {
+						let denial = RequestDenial::new(DenialFault::User, format!("Withdrawal amount {} is lower than 0 after fees", withdraw_req.amt), String::new());
+						return Ok(denial.into_response(StatusCode::BAD_REQUEST));
+					}
+				};
+
+				let withdraw_addr = match financial_info.xmr_addr {
+					Some(addr) => addr,
+					None => {
+						let denial = RequestDenial::new(DenialFault::User, String::from("Withdrawal address not found"), String::from("Please attach a withdrawl address to your account"));
+						return Ok(denial.into_response(StatusCode::BAD_REQUEST));
+					},
+				};
+
+				let transfer_req = TransferReq {
+					username: withdraw_req.username.clone(),
+			        dst: withdraw_addr,
+			        priority: Some(0),
+			        amt: amt_to_send_after_fees,
+			        addr_index: financial_info.transfers.addr_index,
+			    };
+
+				// Because sending RPC calls to the wallet takes forever, we actually add the transaction to a queue of transactions to send
+				match monero_tx_send.send(transfer_req) {
+					Ok(_) =>  {
+						let withdraw_resp = WithdrawMoneroResp {
+					        amt_sent_after_fee: amt_to_send_after_fees,
+					        fee_taken: service_fee + net_fee,
+					    };
+
+					    let json = simd_json::to_string(&withdraw_resp).unwrap();
+
+					    Ok(Response::builder()
+					    	.status(StatusCode::OK)
+					    	.body(json)
+					    	.unwrap())
+
+					},
+					Err(e) => {
+						let denial = RequestDenial::new(DenialFault::Server, String::from("Internal server error, please try again"), String::new());
+						eprintln!("Error on transfer: {e:?}");
+
+						Ok(denial.into_response(StatusCode::INTERNAL_SERVER_ERROR))
+					},
+
+				}
+			} else {
+				let denial = RequestDenial::new(DenialFault::User, format!("User balance {user_balance} is lower than the minimum: {min_amt}"), String::new());
+				Ok(denial.into_response(StatusCode::PRECONDITION_FAILED))
+
+			}
+
+		} else {
+			let denial = RequestDenial::new(DenialFault::User, format!("Withdrawal amount {} is lower than the minimum: {min_amt:?}", withdraw_req.amt), String::new());
+			Ok(denial.into_response(StatusCode::PRECONDITION_FAILED))
+
+		}
+
+	} else {
+		let denial = RequestDenial::new(DenialFault::User, String::from("Invalid username or cookie"), String::new());
+		let json = simd_json::to_string(&denial).unwrap();
+
+		Ok(Response::builder()
+			.status(StatusCode::UNAUTHORIZED)
+			.body(json)
+			.unwrap())
+
+	}
+
 }
 
 pub async fn update_cached_fee(cached_fee: Arc<CachedFee>, wallet: &Wallet) {
@@ -215,82 +341,55 @@ pub async fn update_cached_fee(cached_fee: Arc<CachedFee>, wallet: &Wallet) {
 	}
 }
 
-pub async fn update_acc_balances(money_db: Tree, wallet: &Wallet) {
+pub async fn update_acc_balances(money_db: MoneyDB, wallet: &Wallet, all_transfers: Arc<RwLock<Vec<Transfers>>>) {
 	const TIME_BETWEEN_UPDATES: Duration = Duration::from_secs(5);
 
 	loop {
 		let mut batch = sled::Batch::default();
+        let indices: Vec<u64> = money_db.values().map(|f| f.unwrap().transfers.addr_index).collect();
 
-		let mut num_of_errors: u8 = 0;
+        let all_balances = wallet.get_balance(&indices).await;
 
-		// Updates the amt of money for all users 
-		for db_entry in money_db.iter() {
-			match &db_entry {
-				// TODO: Just use an Arc to get rid of all the cloning
-				Ok(entry) => {
-					let (username, mut financial_info): (String, FinancialInfo) = (
-						bincode::deserialize(&entry.0).unwrap(), 
-						bincode::deserialize(&entry.1).unwrap(),
-					);
+		for res in money_db.sled_iter() {
+			if let Ok((username_bytes, financial_info_bytes)) = res {
+				let username: String = bincode::deserialize(&username_bytes).unwrap();
+				let mut financial_info: FinancialInfo = bincode::deserialize(&financial_info_bytes).unwrap();
 
-					let payment_id = PaymentId::from_slice(&financial_info.payment_id);
+				let all_transfers = all_transfers.read().await;
+				
+                let index_usize: usize = financial_info.transfers.addr_index.try_into().unwrap();
 
-					let payments = match wallet.get_payments(payment_id).await {
-						Ok(payments) => payments,
-						Err(_err) => {
-							num_of_errors += 1;
+				financial_info.transfers = match all_transfers.get(index_usize.checked_sub(1).unwrap()) {
+					Some(t) => t.clone(),
+					None => financial_info.transfers,
+				};
 
-							if num_of_errors >= 5 {
-								eprintln!("Over 5 get_payments errors!")
 
-							}
+                if let Ok(all_balances) = &all_balances {
+                    if let Some(balance) = all_balances.per_subaddress.iter().find(|b| b.addr_index == financial_info.transfers.addr_index) {
+                        financial_info.balance = balance.balance;
 
-							continue;
-						},
+                    } else {
+                        eprintln!("Balance not found!");
 
-					};
+                    }
+                } else {
+                    eprintln!("Error reading all_balances: {:?}", all_balances.as_ref().err().unwrap());
 
-					if payments.len() != financial_info.deposits.len() {
-						 financial_info.deposits = payments.par_iter().filter_map(|payment| {
-							match payment.unlock_time == 0 {
-								true => Some(payment),
-								false => None,
-							}
-						}).cloned().collect();
+                }
 
-						let username_bin = match bincode::serialize(&username) {
-							Ok(bin) => bin,
-							Err(e) => {
-								eprintln!("Could not serialize username due to error: {e:?}, this is very bad news!!!");
-								continue;
-							}
-						};
+                batch.insert(bincode::serialize(&username).unwrap(), bincode::serialize(&financial_info).unwrap());
 
-						let financial_info_bin = match bincode::serialize(&financial_info) {
-							Ok(bin) => bin,
-							Err(e) => {
-								eprintln!("Could not serialize financial_info due to error: {e:?}, this is very bad news!!!");
-								continue;
-							}
-						};
+			} else {
+				eprintln!("Error reading from DB");
+				continue;
 
-						batch.insert(username_bin, financial_info_bin);
-
-					}
-
-				},
-				Err(e) => {
-					eprintln!("Error when trying to access money_db: {e:?}");
-				},
 			}
 
-			// Yields to the tokio Runtime between every update so that the server isn't blocking other async tasks
-			tokio::task::yield_now().await;
 		}
 
-		// Apply all the transactions at once in one large batch
-		money_db.apply_batch(batch).unwrap();
 
+		money_db.apply_batch(batch).unwrap();
 		tokio::time::sleep(TIME_BETWEEN_UPDATES).await;
 	}
 }
@@ -325,11 +424,102 @@ impl CachedFee {
 		match fee == 0 {
 			true => {
 				// If getting the fee fails, just fall back to an older known fee
-				wallet.get_fee().await.unwrap_or(3681250)
+                // Because monero transaction fees given by the daemon are per byte of the
+                // transaction size, we just multiply by the average size of a monero transaction
+                // 2KB
+				wallet.get_fee().await.unwrap_or(4157) * 2_000
 
 			},
 			false => fee,
 
 		}
 	}
+
+    pub async fn get_uptodate_fee(&self, wallet: &Wallet) -> Option<u64> {
+        wallet.get_fee().await.ok().map(|fee_per_byte| fee_per_byte * 2_000)
+    }
+}
+
+pub async fn update_transfers(wallet: &Wallet, all_transfers: Arc<RwLock<Vec<Transfers>>>, money_db: MoneyDB) {
+	loop {
+		let indices: Vec<u64> = money_db.values().map(|f| f.unwrap().transfers.addr_index).collect();
+
+		// Done in its own block to drop the write lock more easily
+		{
+			let mut all_transfers = all_transfers.write().await;
+			*all_transfers = match wallet.get_transfers(&indices, true, true).await {
+				Ok(t) => t,
+				Err(e) => {
+					eprintln!("Error getting transfers: {e:?}");
+					tokio::time::sleep(Duration::from_secs(7)).await;
+					continue;
+				},
+
+			};
+		}
+
+
+		// Update the transfers of all users every 7 seconds
+		tokio::time::sleep(Duration::from_secs(7)).await;
+	}
+}
+
+#[derive(Debug)]
+pub struct TransferReq {
+	username: String,
+	dst: Address,
+	priority: Option<u8>, 
+	amt: u64, 
+	addr_index: u64,
+}
+
+
+pub async fn send_monero(wallet: &'static Wallet, mut monero_tx_req: UnboundedReceiver<TransferReq>, money_db: MoneyDB) {
+	let pending_requests = Arc::new(Mutex::new(Vec::new()));
+	let pending_requests_clone = pending_requests.clone();
+
+	let money_db_clone = money_db.clone();
+
+	tokio::join!(
+		async move {
+			while let Some(req) = monero_tx_req.recv().await {
+				let financial_info = money_db.get(&req.username).unwrap().unwrap();
+
+				if financial_info.get_balance() >= req.amt {
+					pending_requests_clone.clone().lock().push(req);
+
+				}
+			}
+
+			panic!("This task shouldn't ever finish");
+		},
+		async move {
+			loop {
+				// In order to not cause a deadlock, we first yield to the async executor
+				tokio::task::yield_now().await;
+
+				let money_db = money_db_clone.clone();
+
+				// Since a lot of our mutations to the Vec depend on the indexes remaining the same, we keep a lock for the entirety of the loop iteration
+				let pending_requests = &mut pending_requests.lock();
+
+				for i in 0..pending_requests.len() {
+					let req = pending_requests.get(i).unwrap();
+
+					if let Ok(out) = wallet.transfer(req.priority, req.dst, req.amt, req.addr_index).await {
+						let mut financial_info = money_db.get(&req.username).unwrap().unwrap();
+
+						financial_info.service_fee_total += (req.amt + out.fee) / 49;
+						money_db.insert(&req.username, &financial_info).unwrap();
+						money_db.get_tree().flush_async().await.unwrap();
+
+			    		money_db.insert(&req.username, &financial_info).unwrap();
+						pending_requests.remove(i);
+
+					}
+				}
+
+			}
+		}
+	);
 }

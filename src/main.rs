@@ -1,4 +1,5 @@
 mod auth;
+mod db;
 mod fundraiser;
 mod money;
 
@@ -6,14 +7,17 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::sync::{Arc, atomic::AtomicU64};
 
-use monero_wallet::Wallet;
+use monero_wallet::{Transfers, Wallet};
 use once_cell::sync::{Lazy, OnceCell};
 use serde_derive::Serialize;
 use tokio::runtime::Runtime;
+use tokio::sync::{RwLock, mpsc};
+use warp::hyper::Response;
 use warp::{Filter, Rejection, Reply};
 use warp::http::StatusCode;
 
 use auth::*;
+use db::*;
 use money::*;
 use fundraiser::*;
 
@@ -35,58 +39,40 @@ fn main() {
     // Since stuff like the current Monero fee can take a long time to get from the wallet rpc, caching it is wise
     let cached_fee = Arc::new(CachedFee::new());
 
-    let auth_db = db.open_tree(b"auth_db").expect("Failed to open authorization tree, time to panic!");
-    let cookie_db = db.open_tree(b"cookie_db").expect("Failed to open cookie tree, time to panic!");
-    let money_db = db.open_tree(b"money_db").expect("Failed to open money tree, oh no");
-    let fundraiser_db = db.open_tree(b"fundraiser_db").expect("Failed to open fundraiser tree, time to panic!");
-    let current_payment_id_db = db.open_tree(b"current_payment_id_db").expect("Failed to initialize the current payment id");
-    let current_fundraiser_id_db = db.open_tree(b"current_fundraiser_id_db").expect("Failed to initialize current fundraiser ID");
+    let auth_db = AuthDB::new(db.open_tree(b"auth_db").expect("Failed to open authorization tree, time to panic!"));
+    let cookie_db = CookieDB::new(db.open_tree(b"cookie_db").expect("Failed to open cookie tree, time to panic!"));
+    let money_db = MoneyDB::new(db.open_tree(b"money_db").expect("Failed to open money tree, oh no"));
+    let fundraiser_db = FundraiserDB::new(db.open_tree(b"fundraiser_db").expect("Failed to open fundraiser tree, time to panic!"));
+    let current_fundraiser_id_db = CurrentFundraiserIdDB::new(db.open_tree(b"current_fundraiser_id_db").expect("Failed to initialize current fundraiser ID"));
+    let all_transfers: Arc<RwLock<Vec<Transfers>>> = Arc::new(RwLock::new(Vec::new()));
+    let (monero_sender, monero_tx_rcv) = mpsc::unbounded_channel::<TransferReq>();
 
-    let current_payment_id: Arc<AtomicU64> = Arc::new(AtomicU64::new(match current_payment_id_db.get(b"current_id").unwrap() {
-        Some(id_bytes) => u64::from_be_bytes({
-            let mut bytes: [u8; 8] = [0; 8];
-            bytes.copy_from_slice(&id_bytes);
-
-            bytes
-        }),
+    let current_fundraiser_id: Arc<AtomicU64> = Arc::new(AtomicU64::new(match current_fundraiser_id_db.get(&String::from("current_id")).unwrap() {
+        Some(id) => id,
         None => {
-            current_payment_id_db.insert(b"current_id", &[0; 8]).unwrap();
+            current_fundraiser_id_db.insert(&String::from("current_id"), &0).unwrap();
             0
         }
     }));
 
-    let current_fundraiser_id: Arc<AtomicU64> = Arc::new(AtomicU64::new(match current_fundraiser_id_db.get(b"current_id").unwrap() {
-        Some(id_bytes) => u64::from_be_bytes({
-            let mut bytes: [u8; 8] = [0; 8];
-            bytes.copy_from_slice(&id_bytes);
-
-            bytes
-        }),
-        None => {
-            current_fundraiser_id_db.insert(b"current_id", &[0; 8]).unwrap();
-            0
-        }
-    }));
-
-    let auth_db = warp::any().map(move || AuthDB(auth_db.clone()));
+    let auth_db = warp::any().map(move || auth_db.clone());
     let cookie_db_filter = {
         let cookie_db = cookie_db.clone();
-        warp::any().map(move || CookieDB(cookie_db.clone()))
+        warp::any().map(move || cookie_db.clone())
     }; 
     let money_db_filter = {
         let money_db_clone = money_db.clone();
-        warp::any().map(move || MoneyDB(money_db_clone.clone()))
+        warp::any().map(move || money_db_clone.clone())
     };
-    let fundraiser_db_filter = warp::any().map(move || FundraiserDB(fundraiser_db.clone()));
+    let fundraiser_db_filter = warp::any().map(move || fundraiser_db.clone());
     let wallet_filter = warp::any().map(wallet);
-    let current_payment_id_filter = warp::any().map(move || current_payment_id.clone());
-    let current_payment_id_db_filter = warp::any().map(move || current_payment_id_db.clone());
     let current_fundraiser_id_filter = warp::any().map(move || current_fundraiser_id.clone());
     let current_fundraiser_id_db_filter = warp::any().map(move || current_fundraiser_id_db.clone());
     let cached_fee_filter = {
         let cached_fee = cached_fee.clone();
         warp::any().map(move || cached_fee.clone())
     };
+    let monero_send_filter = warp::any().map(move || monero_sender.clone());
 
     let cors = warp::cors()
         .allow_any_origin()
@@ -100,8 +86,6 @@ fn main() {
         .and(auth_db.clone())
         .and(money_db_filter.clone())
         .and(cookie_db_filter.clone())
-        .and(current_payment_id_db_filter)
-        .and(current_payment_id_filter)
         .and_then(register);
 
     let login = warp::path("login")
@@ -119,7 +103,7 @@ fn main() {
         .and(cookie_db_filter.clone())
         .and(money_db_filter.clone())
         .and(wallet_filter)
-        .and(cached_fee_filter)
+        .and(cached_fee_filter.clone())
         .and_then(deposit_req);
 
     let get_balance = warp::path("get_balance")
@@ -130,6 +114,12 @@ fn main() {
         .and(cookie_db_filter.clone())
         .and_then(get_balance);
 
+    let server_profits = warp::path("server_profits")
+        .and(warp::body::content_length_limit(2048))
+        .and(warp::body::json())
+        .and(money_db_filter.clone())
+        .and_then(server_profits);
+
     let attach_xmr_address = warp::path("attach_xmr_address")
         .and(warp::body::content_length_limit(2048))
         .and(warp::body::json())
@@ -137,6 +127,16 @@ fn main() {
         .and(auth_db.clone())
         .and(cookie_db_filter.clone())
         .map(attach_xmr_address);
+
+    let withdraw_monero = warp::path("withdraw_xmr")
+        .and(warp::body::content_length_limit(2048))
+        .and(warp::body::json())
+        .and(auth_db.clone())
+        .and(cookie_db_filter.clone())
+        .and(money_db_filter.clone())
+        .and(cached_fee_filter)
+        .and(monero_send_filter)
+        .and_then(withdraw_monero);
 
     let create_fundraiser = warp::path("create_fundraiser")
         .and(warp::body::content_length_limit(2048))
@@ -162,10 +162,11 @@ fn main() {
             .or(deposit_req)
             .or(attach_xmr_address)
             .or(get_balance)
+            .or(withdraw_monero)
             .or(create_fundraiser)
             .or(search_fundraisers)
+            .or(server_profits)
         );
-
 
     tokio_rt.spawn(async move {
         let wallet = wallet();
@@ -184,8 +185,12 @@ fn main() {
         println!("Successfully configured wallet!");
 
     });
-    tokio_rt.spawn(update_acc_balances(money_db, wallet()));
+
+
+    tokio_rt.spawn(update_transfers(wallet(), all_transfers.clone(), money_db.clone()));
+    tokio_rt.spawn(update_acc_balances(money_db.clone(), wallet(), all_transfers));
     tokio_rt.spawn(update_cached_fee(cached_fee, wallet()));
+    tokio_rt.spawn(send_monero(wallet(), monero_tx_rcv, money_db));
     tokio_rt.spawn_blocking(move || destroy_expired_auth_cookies(cookie_db));
 
     tokio_rt.block_on(warp::serve(post_routes.with(cors).recover(handle_rejection)).run(([127, 0, 0, 1], 3030)));
@@ -197,8 +202,12 @@ fn wallet() -> &'static Wallet {
         // Is it wasteful to spawn a whole tokio Runtime for a single function? Yes.
         // Should I TODO replace this with futures library? Also yes.
         let tokio_rt = Runtime::new().unwrap();
-        println!("Initialized wallet");
-        tokio_rt.block_on(Wallet::new(WALLET_RPC_ADDR.clone(), DAEMON_ADDR.clone(), None, None))
+        println!("Initializing wallet...");
+        let wallet = tokio_rt.block_on(Wallet::new(WALLET_RPC_ADDR.clone(), DAEMON_ADDR.clone(), None, None));
+        println!("Initialized wallet!");
+
+        wallet
+
     })
 }
 
@@ -246,6 +255,7 @@ async fn handle_rejection(err: Rejection) -> Result<impl Reply, Infallible> {
         message: message.into(),
     });
 
+    println!("Rejection resp w code {code}");
     Ok(warp::reply::with_status(json, code))
 }
 
@@ -278,45 +288,14 @@ impl RequestDenial {
             additional_info,
         }
     }
-}
 
-use sled::Tree;
-
-pub struct AuthDB(pub Tree);
-pub struct CookieDB(pub Tree);
-pub struct MoneyDB(pub Tree);
-pub struct FundraiserDB(pub Tree);
-
-
-
-impl std::ops::Deref for AuthDB {
-    type Target = Tree;
-
-    fn deref(&self) -> &Tree {
-        &self.0
+    fn into_response(self, status_code: StatusCode) -> Response<String> {
+        let json = simd_json::to_string(&self).unwrap();
+        
+        Response::builder()
+            .status(status_code)
+            .body(json)
+            .unwrap()
     }
 }
 
-impl std::ops::Deref for CookieDB {
-    type Target = Tree;
-
-    fn deref(&self) -> &Tree {
-        &self.0
-    }
-}
-
-impl std::ops::Deref for MoneyDB {
-    type Target = Tree;
-
-    fn deref(&self) -> &Tree {
-        &self.0
-    }
-}
-
-impl std::ops::Deref for FundraiserDB {
-    type Target = Tree;
-
-    fn deref(&self) -> &Tree {
-        &self.0
-    }
-}
