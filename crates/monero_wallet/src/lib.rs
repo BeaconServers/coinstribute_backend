@@ -5,10 +5,10 @@ use std::time::Duration;
 
 use daemon_rpc::{DaemonRPC, DaemonRPCError};
 use monero::Network;
-use wallet_rpc::{WalletRPC, WalletRPCError};
+use wallet_rpc::WalletRPC;
 
 pub use monero::util::address::{Address, PaymentId};
-pub use wallet_rpc::{Transfers, TransferOut, WalletBalance};
+pub use wallet_rpc::{Transfers, TransferOut, WalletBalance, WalletRPCError};
 
 pub struct Wallet {
     wallet_rpc: WalletRPC,
@@ -56,7 +56,12 @@ impl Wallet {
 
     /// Get the current total balance of this monero wallet (including all user balances)
     pub async fn get_balance(&self, acc_indices: &[u64]) -> Result<WalletBalance, WalletError> {
-        Ok(self.wallet_rpc.get_balance(acc_indices).await?)
+        Ok(self.wallet_rpc.get_balance(acc_indices, true).await?)
+
+    }
+
+    pub async fn get_all_balance(&self, acc_indices: &[u64]) -> Result<WalletBalance, WalletError> {
+        Ok(self.wallet_rpc.get_balance(acc_indices, false).await?)
 
     }
 

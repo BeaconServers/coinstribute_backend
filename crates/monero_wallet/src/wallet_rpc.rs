@@ -106,9 +106,14 @@ impl WalletRPC {
 	}
 
 	/// Returns the wallet balance in piconeros
-	pub async fn get_balance(&self, addr_indices: &[u64]) -> Result<WalletBalance, WalletRPCError> {
+	pub async fn get_balance(&self, addr_indices: &[u64], unlocked: bool) -> Result<WalletBalance, WalletRPCError> {
 		let mut req_body = String::from(r#"{"jsonrpc": "2.0","id": "0","method": "get_balance","params":{"account_index":0,"address_indices":"#);
-		
+		let balance_type = match unlocked {
+			true => "unlocked_balance",
+			false => "balance",
+
+		};
+
 		let addr_indices_string = addr_indices_to_string(addr_indices);
 
 		req_body.push_str(&addr_indices_string);
@@ -123,12 +128,12 @@ impl WalletRPC {
         	Ok(SubaddressBalance {
 	            addr: Address::from_str(val.get("address").ok_or(WalletRPCError::MissingData)?.as_str().unwrap()).unwrap(),
 	            addr_index: val.get("address_index").ok_or(WalletRPCError::MissingData)?.as_u64().unwrap(),
-	            balance: val.get("unlocked_balance").ok_or(WalletRPCError::MissingData)?.as_u64().unwrap(),
+	            balance: val.get(balance_type).ok_or(WalletRPCError::MissingData)?.as_u64().unwrap(),
         	})
         }).collect();
 
        Ok(WalletBalance {
-            balance: result.get("unlocked_balance").ok_or(WalletRPCError::MissingData)?.as_u64().unwrap(),
+            balance: result.get(balance_type).ok_or(WalletRPCError::MissingData)?.as_u64().unwrap(),
             per_subaddress: balances?,
         })
 

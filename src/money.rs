@@ -36,6 +36,7 @@ pub(crate) struct FinancialInfo {
 	deposit_addr: Address,
 	transfers: Transfers,
 	balance: u64,
+	pending_balance: u64,
     active_fundraisers: Vec<Fundraiser>,
 	old_fundraisers: Vec<Fundraiser>,
 	service_fee_total: u64,
@@ -49,6 +50,7 @@ impl FinancialInfo {
 			active_fundraisers: Vec::new(),
 			old_fundraisers: Vec::new(),
 		    balance: 0,
+		    pending_balance: 0,
 		    service_fee_total: 0,
             transfers: Transfers {
 				addr_index,
@@ -68,11 +70,6 @@ impl FinancialInfo {
 		// Using some algebra, we can solve for service_fee (this is for if Susorodni wants to check my math on this lol)
 		// We will just use the max of this calculatin and the self.service_fee_total, since calculating the service fee will lag behind slightly while we wait for thee monero rpc to catch up
 		let transfer_out_service_fee_total: u64 = self.transfers.transfers_out.iter().map(|t| (t.amount + t.fee) / 49).sum();
-
-		if transfer_out_service_fee_total != self.service_fee_total {
-			eprintln!("Calced fee: {transfer_out_service_fee_total} vs self_fee: {}", self.service_fee_total);
-
-		}
 		
 		active_fund_total + past_fund_total + self.balance - (self.service_fee_total.max(transfer_out_service_fee_total))
 
@@ -128,6 +125,7 @@ pub(crate) async fn deposit_req(invoice_req: AuthorizedReq, auth_db: AuthDB, aut
 #[derive(Serialize)]
 struct BalanceReqResp {
 	balance: u64,
+    pending_deposits: u64,
 }
 
 pub async fn get_balance(auth_req: AuthorizedReq, auth_db: AuthDB, money_db: MoneyDB, auth_cookie_db: CookieDB) -> Result<impl Reply, Rejection> {
@@ -136,7 +134,8 @@ pub async fn get_balance(auth_req: AuthorizedReq, auth_db: AuthDB, money_db: Mon
 
         let resp = BalanceReqResp {
 			balance: financial_info.get_balance(),
-		};
+		    pending_deposits: financial_info.pending_balance,
+        };
 
 		let json = simd_json::to_string(&resp).unwrap();
 
@@ -296,8 +295,6 @@ pub async fn withdraw_monero(withdraw_req: WithdrawMoneroReq, auth_db: AuthDB, c
 					},
 					Err(e) => {
 						let denial = RequestDenial::new(DenialFault::Server, String::from("Internal server error, please try again"), String::new());
-						eprintln!("Error on transfer: {e:?}");
-
 						Ok(denial.into_response(StatusCode::INTERNAL_SERVER_ERROR))
 					},
 
@@ -337,18 +334,19 @@ pub async fn update_cached_fee(cached_fee: Arc<CachedFee>, wallet: &Wallet) {
 
 		}
 
-		tokio::time::sleep(Duration::from_secs(5)).await;
+		tokio::time::sleep(Duration::from_secs(8)).await;
 	}
 }
 
 pub async fn update_acc_balances(money_db: MoneyDB, wallet: &Wallet, all_transfers: Arc<RwLock<Vec<Transfers>>>) {
-	const TIME_BETWEEN_UPDATES: Duration = Duration::from_secs(5);
+	const TIME_BETWEEN_UPDATES: Duration = Duration::from_secs(15);
 
 	loop {
 		let mut batch = sled::Batch::default();
         let indices: Vec<u64> = money_db.values().map(|f| f.unwrap().transfers.addr_index).collect();
 
         let all_balances = wallet.get_balance(&indices).await;
+        let all_full_balances = wallet.get_all_balance(&indices).await;
 
 		for res in money_db.sled_iter() {
 			if let Ok((username_bytes, financial_info_bytes)) = res {
@@ -373,9 +371,17 @@ pub async fn update_acc_balances(money_db: MoneyDB, wallet: &Wallet, all_transfe
                         eprintln!("Balance not found!");
 
                     }
-                } else {
-                    eprintln!("Error reading all_balances: {:?}", all_balances.as_ref().err().unwrap());
+               
+                }
 
+                if let Ok(all_full_balances) = &all_full_balances {
+					if let Some(balance) = all_full_balances.per_subaddress.iter().find(|b| b.addr_index == financial_info.transfers.addr_index) {
+                        financial_info.pending_balance = balance.balance - financial_info.balance;
+
+                    } else {
+                        eprintln!("All Balance not found!");
+
+                    }     
                 }
 
                 batch.insert(bincode::serialize(&username).unwrap(), bincode::serialize(&financial_info).unwrap());
@@ -450,8 +456,7 @@ pub async fn update_transfers(wallet: &Wallet, all_transfers: Arc<RwLock<Vec<Tra
 			*all_transfers = match wallet.get_transfers(&indices, true, true).await {
 				Ok(t) => t,
 				Err(e) => {
-					eprintln!("Error getting transfers: {e:?}");
-					tokio::time::sleep(Duration::from_secs(7)).await;
+					tokio::time::sleep(Duration::from_secs(30)).await;
 					continue;
 				},
 
@@ -460,7 +465,7 @@ pub async fn update_transfers(wallet: &Wallet, all_transfers: Arc<RwLock<Vec<Tra
 
 
 		// Update the transfers of all users every 7 seconds
-		tokio::time::sleep(Duration::from_secs(7)).await;
+		tokio::time::sleep(Duration::from_secs(30)).await;
 	}
 }
 
@@ -480,8 +485,8 @@ pub async fn send_monero(wallet: &'static Wallet, mut monero_tx_req: UnboundedRe
 
 	let money_db_clone = money_db.clone();
 
-	tokio::join!(
-		async move {
+	let (a, b) = tokio::join!(
+		tokio::task::spawn(async move {
 			while let Some(req) = monero_tx_req.recv().await {
 				let financial_info = money_db.get(&req.username).unwrap().unwrap();
 
@@ -492,8 +497,8 @@ pub async fn send_monero(wallet: &'static Wallet, mut monero_tx_req: UnboundedRe
 			}
 
 			panic!("This task shouldn't ever finish");
-		},
-		async move {
+		}),
+		tokio::task::spawn(async move {
 			loop {
 				// In order to not cause a deadlock, we first yield to the async executor
 				tokio::task::yield_now().await;
@@ -502,24 +507,37 @@ pub async fn send_monero(wallet: &'static Wallet, mut monero_tx_req: UnboundedRe
 
 				// Since a lot of our mutations to the Vec depend on the indexes remaining the same, we keep a lock for the entirety of the loop iteration
 				let pending_requests = &mut pending_requests.lock();
+				let mut i = 0;
 
-				for i in 0..pending_requests.len() {
+				loop {
+					if i >= pending_requests.len() {
+						break;
+					}
+
 					let req = pending_requests.get(i).unwrap();
 
-					if let Ok(out) = wallet.transfer(req.priority, req.dst, req.amt, req.addr_index).await {
-						let mut financial_info = money_db.get(&req.username).unwrap().unwrap();
+					match wallet.transfer(req.priority, req.dst, req.amt, req.addr_index).await {
+						Ok(out) => {
+                            let mut financial_info = money_db.get(&req.username).unwrap().unwrap();
 
-						financial_info.service_fee_total += (req.amt + out.fee) / 49;
-						money_db.insert(&req.username, &financial_info).unwrap();
-						money_db.get_tree().flush_async().await.unwrap();
+						    financial_info.service_fee_total += (req.amt + out.fee) / 49;
+						    money_db.insert(&req.username, &financial_info).unwrap();
+						    money_db.get_tree().flush_async().await.unwrap();
 
-			    		money_db.insert(&req.username, &financial_info).unwrap();
-						pending_requests.remove(i);
+			    		    money_db.insert(&req.username, &financial_info).unwrap();
+						    pending_requests.remove(i);
+                        },
+                        Err(_err) => {
+                        	i += 1;
+                        },
 
 					}
 				}
 
 			}
-		}
+		})
 	);
+
+	a.unwrap();
+	b.unwrap();
 }
