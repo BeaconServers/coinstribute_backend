@@ -29,43 +29,52 @@ DEALINGS IN THE SOFTWARE.
  */
 
 use std::time::Duration;
-
 use hashbrown::HashSet;
 use hex_simd::AsciiCase;
 use rayon::prelude::*;
-use reqwest::{Client, ClientBuilder, Method};
+use hyper::client::HttpConnector;
+use hyper::{Client, Request, Body};
 use simd_json::ValueAccess;
 
 pub struct DaemonRPC {
-	client: Client,
+	client: Client<HttpConnector, Body>,
 	daemon_url: String,
 }
 
 impl DaemonRPC {
-	pub(crate) fn new(daemon_url: String, connection_timeout: Option<Duration>, send_timeout: Option<Duration>) -> Self {
+	pub(crate) fn new(daemon_url: String, connection_timeout: Option<Duration>) -> Self {
+		let mut connector = HttpConnector::new();
+		connector.set_connect_timeout(connection_timeout);
+
+		let client = Client::builder()
+			.build(connector);
+
 		Self {
-			client: ClientBuilder::new()
-				.connect_timeout(connection_timeout.unwrap_or(Duration::from_millis(1000)))
-				.timeout(send_timeout.unwrap_or(Duration::from_millis(1000)))
-				.build()
-				.unwrap(),
+			client,
 			daemon_url,
 
 		}
 	}
 
-	async fn request(&self, payload: &str, endpoint: &str) -> Result<simd_json::owned::Value, DaemonRPCError> {
+		async fn request(&self, payload: &str, url: &str) -> Result<simd_json::owned::Value, DaemonRPCError> {
 		let mut last_error = None;
 		const MAX_CONN_ATTEMPTS: u8 = 5;
 
 		// Attempt up to 5 times to send a request before returning an error
 		for i in 0..MAX_CONN_ATTEMPTS {
-			let req = self.client.request(Method::POST, self.daemon_url.clone() + endpoint)
-				.body(payload.to_string())
-				.build()?;
+			let req = Request::post(self.daemon_url.to_string() + url)
+				.body(Body::from(payload.to_string()))
+				.unwrap();
 
-			match self.client.execute(req).await {
-				Ok(response) => return Ok(response.json::<simd_json::owned::Value>().await?),
+			match self.client.request(req).await {
+				Ok(response) => {
+					let response = hyper::body::to_bytes(response.into_body()).await?;
+					let mut response = response.to_vec();
+
+					let val = simd_json::to_owned_value(&mut response);
+					return Ok(val?);
+
+				},
 				Err(err) => match err.is_timeout() {
 					true => {
 						if i == MAX_CONN_ATTEMPTS - 1 {
@@ -74,12 +83,12 @@ impl DaemonRPC {
 
 						continue;
 					},
-					false => return Err(DaemonRPCError::ReqwestError(err)),
+					false => Err(DaemonRPCError::HyperError(err))?,
 				},
 			};
 		}
 
-		return Err(DaemonRPCError::ReqwestError(last_error.unwrap()))
+		Err(DaemonRPCError::HyperError(last_error.unwrap()))?
 
 	}
 
@@ -253,17 +262,26 @@ impl DaemonRPC {
 pub enum DaemonRPCError {
 	MissingData,
 	MoneroEncodingError(monero::consensus::encode::Error),
-	ReqwestError(reqwest::Error),
-	HexError(hex_simd::Error)
+	HyperError(hyper::Error),
+	HexError(hex_simd::Error),
+	JSONError(simd_json::Error)
 
 }
 
-impl From<reqwest::Error> for DaemonRPCError {
-    fn from(e: reqwest::Error) -> Self {
-        Self::ReqwestError(e)
+impl From<hyper::Error> for DaemonRPCError {
+    fn from(e: hyper::Error) -> Self {
+        Self::HyperError(e)
 
     }
 }
+
+impl From<simd_json::Error> for DaemonRPCError {
+    fn from(e: simd_json::Error) -> Self {
+        Self::JSONError(e)
+
+    }
+}
+
 
 impl From<monero::consensus::encode::Error> for DaemonRPCError {
 	fn from(e: monero::consensus::encode::Error) -> Self {

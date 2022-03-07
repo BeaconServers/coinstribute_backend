@@ -2,32 +2,37 @@ use std::{time::Duration, str::FromStr};
 
 use monero::Address;
 use rayon::prelude::*;
-use reqwest::{Client, ClientBuilder, Method};
+use hyper::client::HttpConnector;
+use hyper::{Client, Request, Body};
 use simd_json::{ValueAccess, Mutable};
 use serde::{Serialize, Deserialize};
 
 pub struct WalletRPC {
-	client: Client,
+	client: Client<HttpConnector, Body>,
 	/// For requests that can be expected to take up to 45 seconds
-	long_client: Client,
+	long_client: Client<HttpConnector, Body>,
 	wallet_daemon_url: String,
 }
 
 impl WalletRPC {
-	pub(crate) fn new(mut wallet_daemon_url: String, connection_timeout: Option<Duration>, send_timeout: Option<Duration>) -> Self {
+	pub(crate) fn new(mut wallet_daemon_url: String, connection_timeout: Option<Duration>) -> Self {
 		wallet_daemon_url.push_str("/json_rpc");
 
+		let mut connector = HttpConnector::new();
+		connector.set_connect_timeout(connection_timeout);
+
+		let mut long_connector = HttpConnector::new();
+		long_connector.set_connect_timeout(Some(Duration::from_secs(30)));
+
+		let client = Client::builder()
+			.build(connector);
+
+		let long_client = Client::builder()
+			.build(long_connector);
+
 		Self {
-			client: ClientBuilder::new()
-				.connect_timeout(connection_timeout.unwrap_or(Duration::from_millis(3500)))
-				.timeout(send_timeout.unwrap_or(Duration::from_millis(3500)))
-				.build()
-				.unwrap(),
-			long_client: ClientBuilder::new()
-				.connect_timeout(connection_timeout.unwrap_or(Duration::from_secs(40)))
-				.timeout(send_timeout.unwrap_or(Duration::from_secs(40)))
-				.build()
-				.unwrap(),
+			client,
+			long_client,
 			wallet_daemon_url,
 
 		}
@@ -39,12 +44,19 @@ impl WalletRPC {
 
 		// Attempt up to 5 times to send a request before returning an error
 		for i in 0..MAX_CONN_ATTEMPTS {
-			let req = self.client.request(Method::POST, &self.wallet_daemon_url)
-				.body(payload.to_string())
-				.build()?;
+			let req = Request::post(&self.wallet_daemon_url)
+				.body(Body::from(payload.to_string()))
+				.unwrap();
 
-			match self.client.execute(req).await {
-				Ok(response) => return Ok(response.json::<simd_json::owned::Value>().await?),
+			match self.client.request(req).await {
+				Ok(response) => {
+					let response = hyper::body::to_bytes(response.into_body()).await?;
+					let mut response = response.to_vec();
+
+					let val = simd_json::to_owned_value(&mut response);
+					return Ok(val?);
+
+				},
 				Err(err) => match err.is_timeout() {
 					true => {
 						if i == MAX_CONN_ATTEMPTS - 1 {
@@ -53,12 +65,12 @@ impl WalletRPC {
 
 						continue;
 					},
-					false => Err(WalletRPCError::ReqwestError(err))?,
+					false => Err(WalletRPCError::HyperError(err))?,
 				},
 			};
 		}
 
-		Err(WalletRPCError::ReqwestError(last_error.unwrap()))?
+		Err(WalletRPCError::HyperError(last_error.unwrap()))?
 
 	}
 
@@ -67,13 +79,21 @@ impl WalletRPC {
 		let mut last_error = None;
 		const MAX_CONN_ATTEMPTS: u8 = 2;
 
+		// Attempt up to 5 times to send a request before returning an error
 		for i in 0..MAX_CONN_ATTEMPTS {
-			let req = self.long_client.request(Method::POST, &self.wallet_daemon_url)
-				.body(payload.to_string())
-				.build()?;
+			let req = Request::post(&self.wallet_daemon_url)
+				.body(Body::from(payload.to_string()))
+				.unwrap();
 
-			match self.long_client.execute(req).await {
-				Ok(response) => return Ok(response.json::<simd_json::owned::Value>().await?),
+			match self.long_client.request(req).await {
+				Ok(response) => {
+					let response = hyper::body::to_bytes(response.into_body()).await?;
+					let mut response = response.to_vec();
+
+					let val = simd_json::to_owned_value(&mut response);
+					return Ok(val?);
+
+				},
 				Err(err) => match err.is_timeout() {
 					true => {
 						if i == MAX_CONN_ATTEMPTS - 1 {
@@ -82,12 +102,12 @@ impl WalletRPC {
 
 						continue;
 					},
-					false => Err(WalletRPCError::ReqwestError(err))?,
+					false => Err(WalletRPCError::HyperError(err))?,
 				},
 			};
 		}
 
-		Err(WalletRPCError::ReqwestError(last_error.unwrap()))?
+		Err(WalletRPCError::HyperError(last_error.unwrap()))?
 
 	}
 
@@ -378,13 +398,20 @@ pub enum WalletRPCError {
 	InvalidSetRefreshReq,
 	MissingData,
 	AddrError(monero::util::address::Error),
-	ReqwestError(reqwest::Error),
+	HyperError(hyper::Error),
+	JSONError(simd_json::Error),
 
 }
 
-impl From<reqwest::Error> for WalletRPCError {
-    fn from(err: reqwest::Error) -> Self {
-        Self::ReqwestError(err)
+impl From<hyper::Error> for WalletRPCError {
+    fn from(err: hyper::Error) -> Self {
+        Self::HyperError(err)
+    }
+}
+
+impl From<simd_json::Error> for WalletRPCError {
+    fn from(err: simd_json::Error) -> Self {
+        Self::JSONError(err)
     }
 }
 

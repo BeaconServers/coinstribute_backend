@@ -13,7 +13,7 @@ monero = { version = "0.16", features = ["serde_support"] }
 # Easy parallel processing
 rayon = { version = "1" }
 # An async request sending library in Rust
-reqwest = { version = "0.11", default-features = false, features = ["json"] }
+hyper = { version = "0.14", default-features = false, features = ["client", "http1", "tcp"] }
 # A fast JSON parser that uses SIMD instructions (faster than serde_json)
 simd-json = { version = "0.4", features = ["serde"] }
 # Serialization

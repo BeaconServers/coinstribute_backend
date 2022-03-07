@@ -19,9 +19,9 @@ pub struct Wallet {
 
 impl Wallet {
     /// Creates a new Wallet configured in a sepcific way
-    pub async fn new(wallet_url: String, daemon_url: String, connection_timeout: Option<Duration>, send_timeout: Option<Duration>) -> Self {
-        let wallet_rpc = WalletRPC::new(wallet_url, connection_timeout, send_timeout);
-        let daemon_rpc = DaemonRPC::new(daemon_url, connection_timeout, send_timeout);
+    pub async fn new(wallet_url: String, daemon_url: String, connection_timeout: Option<Duration>) -> Self {
+        let wallet_rpc = WalletRPC::new(wallet_url, connection_timeout);
+        let daemon_rpc = DaemonRPC::new(daemon_url, connection_timeout);
 
         let mut addr: Option<Address> = None;
 

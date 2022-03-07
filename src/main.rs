@@ -203,7 +203,7 @@ fn wallet() -> &'static Wallet {
         // Should I TODO replace this with futures library? Also yes.
         let tokio_rt = Runtime::new().unwrap();
         println!("Initializing wallet...");
-        let wallet = tokio_rt.block_on(Wallet::new(WALLET_RPC_ADDR.clone(), DAEMON_ADDR.clone(), None, None));
+        let wallet = tokio_rt.block_on(Wallet::new(WALLET_RPC_ADDR.clone(), DAEMON_ADDR.clone(), Some(Duration::from_secs(3))));
         println!("Initialized wallet!");
 
         wallet
