@@ -117,43 +117,43 @@ impl WalletRPC {
 		req_body.push_str(r#""}}"#);
 
 		let response = self.request(&req_body).await?;
-		let result = response.get("result").ok_or(WalletRPCError::MissingData)?;
+		let result = response.get("result").ok_or(WalletRPCError::MissingData("result"))?;
 
-		let addr = Address::from_str(result.get("address").ok_or(WalletRPCError::MissingData)?.as_str().unwrap()).unwrap();
-		let acc_index = result.get("address_index").ok_or(WalletRPCError::MissingData)?.as_u64().unwrap();
+		let addr = Address::from_str(result.get("address").ok_or(WalletRPCError::MissingData("address"))?.as_str().unwrap()).unwrap();
+		let acc_index = result.get("address_index").ok_or(WalletRPCError::MissingData("address_index"))?.as_u64().unwrap();
 
 		Ok((addr, acc_index))
 	}
 
 	/// Returns the wallet balance in piconeros
 	pub async fn get_balance(&self, addr_indices: &[u64], unlocked: bool) -> Result<WalletBalance, WalletRPCError> {
-		let mut req_body = String::from(r#"{"jsonrpc": "2.0","id": "0","method": "get_balance","params":{"account_index":0,"address_indices":"#);
-		let balance_type = match unlocked {
+		let mut req_body = String::from(r#"{"jsonrpc":"2.0","id":"0","method": "get_balance","params":{"account_index":0,"address_indices":"#);
+
+		req_body.push_str(&addr_indices_to_string(addr_indices));
+		req_body.push_str("}}");
+
+        let mut response = self.request(&req_body).await?;
+        
+        let result = response.get_mut("result").ok_or(WalletRPCError::MissingData("result"))?;
+
+        let per_subaddress = result.get_mut("per_subaddress").ok_or(WalletRPCError::MissingData("per_subaddress"))?.as_array_mut().unwrap();
+
+        let balance_type = match unlocked {
 			true => "unlocked_balance",
 			false => "balance",
 
 		};
 
-		let addr_indices_string = addr_indices_to_string(addr_indices);
-
-		req_body.push_str(&addr_indices_string);
-		req_body.push_str("}}");
-
-        let mut response = self.request(&req_body).await?;
-        let result = response.get_mut("result").ok_or(WalletRPCError::MissingData)?;
-
-        let per_subaddress = result.get_mut("per_subaddress").ok_or(WalletRPCError::MissingData)?.as_array_mut().unwrap();
-
         let balances: Result<Vec<SubaddressBalance>, WalletRPCError> = per_subaddress.par_drain(..).map(|val| {
         	Ok(SubaddressBalance {
-	            addr: Address::from_str(val.get("address").ok_or(WalletRPCError::MissingData)?.as_str().unwrap()).unwrap(),
-	            addr_index: val.get("address_index").ok_or(WalletRPCError::MissingData)?.as_u64().unwrap(),
-	            balance: val.get(balance_type).ok_or(WalletRPCError::MissingData)?.as_u64().unwrap(),
+	            addr: Address::from_str(val.get("address").ok_or(WalletRPCError::MissingData("address"))?.as_str().unwrap()).unwrap(),
+	            addr_index: val.get("address_index").ok_or(WalletRPCError::MissingData("address_index"))?.as_u64().unwrap(),
+	            balance: val.get(balance_type).ok_or(WalletRPCError::MissingData(balance_type))?.as_u64().unwrap(),
         	})
         }).collect();
 
        Ok(WalletBalance {
-            balance: result.get(balance_type).ok_or(WalletRPCError::MissingData)?.as_u64().unwrap(),
+            balance: result.get(balance_type).ok_or(WalletRPCError::MissingData(balance_type))?.as_u64().unwrap(),
             per_subaddress: balances?,
         })
 
@@ -173,7 +173,7 @@ impl WalletRPC {
 		req.push_str("}}");
 
 		let response = self.request(&req).await?;
-		let result = response.get("result").ok_or(WalletRPCError::MissingData)?;
+		let result = response.get("result").ok_or(WalletRPCError::MissingData("result"))?;
 
 		let val_to_transfer = |val: &simd_json::owned::Value| -> Option<Transfer> {
             Some(Transfer {
@@ -273,7 +273,7 @@ impl WalletRPC {
 		const REQUEST_BODY: &'static str = r#"{"jsonrpc":"2.0","id":"0","method":"get_address","params":{"account_index":0}}}"#;
 
         let response = self.request(REQUEST_BODY).await?;
-        let addr_str = response["result"]["address"].as_str().ok_or(WalletRPCError::MissingData)?;
+        let addr_str = response["result"]["address"].as_str().ok_or(WalletRPCError::MissingData("address"))?;
 
         Ok(Address::from_str(addr_str)?)
 
@@ -298,12 +298,12 @@ impl WalletRPC {
 
 		let response = self.long_request(&req_body).await?;
 
-		let result = response.get("result").ok_or(WalletRPCError::MissingData)?;
+		let result = response.get("result").ok_or(WalletRPCError::MissingData("result"))?;
 		
 		Ok(TransferOut {
-			amount: result.get("amount").ok_or(WalletRPCError::MissingData)?.as_u64().unwrap(),
-			fee: result.get("fee").ok_or(WalletRPCError::MissingData)?.as_u64().unwrap(),
-			tx_key: result.get("tx_key").ok_or(WalletRPCError::MissingData)?.as_str().unwrap().to_string(),
+			amount: result.get("amount").ok_or(WalletRPCError::MissingData("amount"))?.as_u64().unwrap(),
+			fee: result.get("fee").ok_or(WalletRPCError::MissingData("fee"))?.as_u64().unwrap(),
+			tx_key: result.get("tx_key").ok_or(WalletRPCError::MissingData("tx_key"))?.as_str().unwrap().to_string(),
 		})
 
 	}
@@ -392,11 +392,11 @@ pub struct SubaddressBalance {
 }
 
 #[derive(Debug)]
-pub enum WalletRPCError {
+pub enum WalletRPCError{
 	InvalidPaymentId,
 	InvalidSetDaemonReq,
 	InvalidSetRefreshReq,
-	MissingData,
+	MissingData(&'static str),
 	AddrError(monero::util::address::Error),
 	HyperError(hyper::Error),
 	JSONError(simd_json::Error),
@@ -426,8 +426,11 @@ fn addr_indices_to_string(addr_indices: &[u64]) -> String {
 	let mut addr_indices_string = String::from("[");
 
 	addr_indices.iter().for_each(|index| {
-		addr_indices_string.push_str(&index.to_string());
-	});
+        addr_indices_string.push_str(&index.to_string());
+        addr_indices_string.push(',');
+    });
+
+    addr_indices_string.pop().unwrap();
 	addr_indices_string.push(']');
 
 	addr_indices_string

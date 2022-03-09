@@ -363,31 +363,34 @@ pub async fn update_acc_balances(money_db: MoneyDB, wallet: &Wallet, all_transfe
 				};
 
 
-                if let Ok(all_balances) = &all_balances {
-                    if let Some(balance) = all_balances.per_subaddress.iter().find(|b| b.addr_index == financial_info.transfers.addr_index) {
-                        financial_info.balance = balance.balance;
+                match &all_balances {
+					Ok(all_balances) => {
+	                    if let Some(balance) = all_balances.per_subaddress.iter().find(|b| b.addr_index == financial_info.transfers.addr_index) {
+	                        financial_info.balance = balance.balance;
 
-                    } else {
-                        eprintln!("Balance not found!");
+	                    }
+                	}, 
+                	Err(err) => {
+                        eprintln!("Balance not found due to error: {err:?}");
+                	}               
+                };
+
+                match &all_full_balances {
+                	Ok(all_full_balances) => {
+						if let Some(balance) = all_full_balances.per_subaddress.iter().find(|b| b.addr_index == financial_info.transfers.addr_index) {
+	                        financial_info.pending_balance = balance.balance - financial_info.balance;
+
+	                    }
+                    } Err(err) => {
+                        eprintln!("All Balance not found due to error: {err:?}");
 
                     }
-               
-                }
-
-                if let Ok(all_full_balances) = &all_full_balances {
-					if let Some(balance) = all_full_balances.per_subaddress.iter().find(|b| b.addr_index == financial_info.transfers.addr_index) {
-                        financial_info.pending_balance = balance.balance - financial_info.balance;
-
-                    } else {
-                        eprintln!("All Balance not found!");
-
-                    }     
-                }
+                };
 
                 batch.insert(bincode::serialize(&username).unwrap(), bincode::serialize(&financial_info).unwrap());
 
 			} else {
-				eprintln!("Error reading from DB");
+				//eprintln!("Error reading from DB");
 				continue;
 
 			}
@@ -455,7 +458,7 @@ pub async fn update_transfers(wallet: &Wallet, all_transfers: Arc<RwLock<Vec<Tra
 			let mut all_transfers = all_transfers.write().await;
 			*all_transfers = match wallet.get_transfers(&indices, true, true).await {
 				Ok(t) => t,
-				Err(e) => {
+				Err(_e) => {
 					tokio::time::sleep(Duration::from_secs(30)).await;
 					continue;
 				},
@@ -491,7 +494,7 @@ pub async fn send_monero(wallet: &'static Wallet, mut monero_tx_req: UnboundedRe
 				let financial_info = money_db.get(&req.username).unwrap().unwrap();
 
 				if financial_info.get_balance() >= req.amt {
-					pending_requests_clone.clone().lock().push(req);
+					pending_requests_clone.clone().lock().await.push(req);
 
 				}
 			}
@@ -506,7 +509,7 @@ pub async fn send_monero(wallet: &'static Wallet, mut monero_tx_req: UnboundedRe
 				let money_db = money_db_clone.clone();
 
 				// Since a lot of our mutations to the Vec depend on the indexes remaining the same, we keep a lock for the entirety of the loop iteration
-				let pending_requests = &mut pending_requests.lock();
+				let pending_requests = &mut pending_requests.lock().await;
 				let mut i = 0;
 
 				loop {
@@ -534,6 +537,7 @@ pub async fn send_monero(wallet: &'static Wallet, mut monero_tx_req: UnboundedRe
 					}
 				}
 
+                tokio::time::sleep(Duration::from_secs(5)).await;
 			}
 		})
 	);
