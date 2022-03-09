@@ -60,6 +60,7 @@ impl Wallet {
 
     }
 
+    /// Same as get_balance, except it will also show pending deposits
     pub async fn get_all_balance(&self, acc_indices: &[u64]) -> Result<WalletBalance, WalletError> {
         Ok(self.wallet_rpc.get_balance(acc_indices, false).await?)
 

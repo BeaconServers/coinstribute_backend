@@ -1,15 +1,15 @@
+use crate::logging::{Log, LogType, Event, Priority};
 use crate::db::{DB, AuthDB, CookieDB, MoneyDB};
 
 use std::fmt::Display;
+use std::net::SocketAddr;
 use std::time::{SystemTime, Duration};
-
-use argon2::{ThreadMode, Variant, Version};
 
 use rand::prelude::*;
 use rand::distributions::Alphanumeric;
 
-use once_cell::sync::Lazy;
 use serde::{Serialize, Deserialize};
+use tokio::sync::mpsc::Sender;
 use warp::reply::Reply;
 use warp::{http::Response, hyper::StatusCode};
 use warp::Rejection;
@@ -17,28 +17,10 @@ use warp::Rejection;
 use crate::{DenialFault, RequestDenial, wallet};
 use crate::money::FinancialInfo;
 
-pub(crate) static ARGON2_CONFIG: Lazy<argon2::Config> = Lazy::new(|| argon2::Config {
-    ad: &[],
-    hash_length: 32,
-    lanes: {
-       let num_threads: usize = std::thread::available_parallelism().unwrap().into();
-       let num_threads: u32 = num_threads.try_into().unwrap();
-
-       num_threads
-    },
-    mem_cost: 4096,
-    secret: &[],
-    thread_mode: ThreadMode::Parallel,
-    time_cost: 3,
-    variant: Variant::Argon2i,
-    version: Version::Version13,
-});
-
-
 const RESERVED_USERNAMES: [&str; 8] = ["admin", "root", "sudo", "bootlegbilly", "susorodni", "billyb2", "billyb", "billy"];
 
 const MIN_USER_LEN: usize = 4;
-const MAX_USER_LEN: usize = 30;
+const MAX_USER_LEN: usize = 50;
 
 #[derive(Deserialize)]
 pub struct AuthRequest {
@@ -51,7 +33,7 @@ pub struct AuthRequest {
 pub struct User {
     username: String,
     salt: [u8; 32],
-    hashed_password: Vec<u8>,
+    hashed_password: [u8; blake3::OUT_LEN],
 
 }
 
@@ -105,10 +87,9 @@ impl From<bincode::Error> for GenAuthCookieErr {
     }
 }
 
-pub(crate) async fn register(user_info: AuthRequest, auth_db: AuthDB, money_db: MoneyDB, auth_cookie_db: CookieDB) -> Result<impl Reply, Rejection> {
+pub async fn register(user_info: AuthRequest, auth_db: AuthDB, money_db: MoneyDB, auth_cookie_db: CookieDB, socket_addr: Option<SocketAddr>, logger: Sender<Log>) -> Result<impl Reply, Rejection> {
     let username = user_info.username.to_lowercase();
     let password = user_info.password;
-
 
     let get_res = async move { match auth_db.contains_key(&username).unwrap() {
         true => {
@@ -117,6 +98,15 @@ pub(crate) async fn register(user_info: AuthRequest, auth_db: AuthDB, money_db: 
                 "Username already registered".to_string(),
                 String::new(),
             );
+
+            Log::new(
+                Some(username.clone()), 
+                socket_addr.unwrap().ip(), 
+                Event::Registration { success: false }, 
+                LogType::Auth, 
+                login_req_denial.reason.clone(),
+                Priority::Low,
+            ).send(&logger).await.unwrap();
 
             Ok(login_req_denial.into_response(StatusCode::CONFLICT))
         },
@@ -128,7 +118,16 @@ pub(crate) async fn register(user_info: AuthRequest, auth_db: AuthDB, money_db: 
                     String::new(),
                 );
 
-                return Ok(login_req_denial.into_response(StatusCode::BAD_GATEWAY));
+                Log::new(
+                    Some(username.clone()), 
+                    socket_addr.unwrap().ip(), 
+                    Event::Registration { success: false }, 
+                    LogType::Auth, 
+                    login_req_denial.reason.clone(),
+                    Priority::Low,
+                ).send(&logger).await.unwrap();
+
+                return Ok(login_req_denial.into_response(StatusCode::BAD_REQUEST));
 
             }
 
@@ -137,9 +136,13 @@ pub(crate) async fn register(user_info: AuthRequest, auth_db: AuthDB, money_db: 
 
             // Since both of these are relatively long tasks, there's no reason not to run them in parallel.
             // Especially since create_account is async
-            let (create_acc_res, hashed_password) = tokio::join!(
-                wallet().create_address(&username),
-                tokio::task::spawn_blocking(move || argon2::hash_raw(password.as_bytes(), &salt, &ARGON2_CONFIG))
+            let (create_acc_res, hashed_password) = tokio::join!({
+                let start_time = std::time::Instant::now();
+                let addr = wallet().create_address(&username);
+                println!("Time to create addr: {}", std::time::Instant::now().duration_since(start_time).as_secs_f32());
+                addr
+            },
+                tokio::task::spawn_blocking(move || hash_password(password.as_bytes(), &salt))
             );
 
             let (addr, addr_index) = match create_acc_res {
@@ -151,28 +154,24 @@ pub(crate) async fn register(user_info: AuthRequest, auth_db: AuthDB, money_db: 
                         format!("Error creating financial account due to {err:?}"),
                     );
 
-                    return Ok(denial.into_response(StatusCode::INTERNAL_SERVER_ERROR));
-                }
-
-            };
-
-            let hashed_password = match hashed_password.unwrap().ok() {
-                Some(hash) => hash,
-                None => {
-                    let denial = RequestDenial::new(
-                        DenialFault::Server,
-                        "Internal Server Error".to_string(),
-                        String::from("Password hasing"),
-                    );
+                    Log::new(
+                        Some(username.clone()), 
+                        socket_addr.unwrap().ip(), 
+                        Event::Registration { success: false }, 
+                        LogType::Auth, 
+                        denial.reason.clone(),
+                        Priority::High,
+                    ).send(&logger).await.unwrap();
 
                     return Ok(denial.into_response(StatusCode::INTERNAL_SERVER_ERROR));
                 }
+
             };
 
             let user = User {
                 username,
                 salt,
-                hashed_password,
+                hashed_password: hashed_password.unwrap(),
             };
 
             auth_db.insert(&user.username, &user).unwrap();
@@ -180,7 +179,7 @@ pub(crate) async fn register(user_info: AuthRequest, auth_db: AuthDB, money_db: 
 
             let cookie = generate_auth_cookie(&user.username, &auth_db, auth_cookie_db.clone());
 
-            Ok(auth_cookie_result_to_response(user.username, cookie))
+            Ok(auth_cookie_result_to_response(user.username, cookie, &logger, socket_addr, false).await)
 
         }
     }};
@@ -194,7 +193,7 @@ pub(crate) async fn register(user_info: AuthRequest, auth_db: AuthDB, money_db: 
     res
 }
 
-pub(crate) async fn login(user_info: AuthRequest, auth_db: AuthDB, auth_cookie_db: CookieDB) -> Result<impl Reply, Rejection> {
+pub(crate) async fn login(user_info: AuthRequest, auth_db: AuthDB, auth_cookie_db: CookieDB, socket_addr: Option<SocketAddr>, logger: Sender<Log>) -> Result<impl Reply, Rejection> {
     let username = user_info.username.to_lowercase();
     let password = user_info.password;
 
@@ -205,29 +204,43 @@ pub(crate) async fn login(user_info: AuthRequest, auth_db: AuthDB, auth_cookie_d
         String::new(),
     );
 
+    let denial_log = Log::new(
+        Some(username.clone()), 
+        socket_addr.unwrap().ip(), 
+        Event::Login { success: false }, 
+        LogType::Auth, 
+        denial.reason.clone(),
+        Priority::Low,
+    );
+
     let wrong_user_or_pass_resp = denial.into_response(StatusCode::UNAUTHORIZED);
 
-    let give_response = move || match auth_db.get(&username).unwrap() {
+    let give_response = async move { match auth_db.get(&username).unwrap() {
         Some(user_info) => {
-            match argon2::verify_raw(password.as_bytes(), &user_info.salt, &user_info.hashed_password, &ARGON2_CONFIG).unwrap() {
+            tokio::task::yield_now().await;
+            match verify_hash(password.as_bytes(), &user_info.hashed_password) {
                 // Login successful
                 true => {
                 	let auth_cookie = generate_auth_cookie(&username, &auth_db, auth_cookie_db.clone());
-                	Ok(auth_cookie_result_to_response(username, auth_cookie))
+                	Ok(auth_cookie_result_to_response(username, auth_cookie, &logger, socket_addr, true).await)
 
                 },
                 false => {
+                    denial_log.send(&logger).await.unwrap();
                     Ok(wrong_user_or_pass_resp)
 
                 },
 
             }
         },
-        None => Ok(wrong_user_or_pass_resp),
-    };
+        None => {
+            denial_log.send(&logger).await.unwrap();
+            Ok(wrong_user_or_pass_resp)
+        },
+    }};
 
     let (res, _) = tokio::join!(
-        tokio::task::spawn_blocking(give_response),
+        tokio::task::spawn(give_response),
         tokio::time::sleep(Duration::from_millis(100)),
     );
 
@@ -269,14 +282,46 @@ fn generate_auth_cookie(username: &String, auth_db: &AuthDB, auth_cookie_db: Coo
 
 }
 
-fn auth_cookie_result_to_response(username: String, auth_cookie: Result<AuthCookie, GenAuthCookieErr>) -> Response<String> {
+async fn auth_cookie_result_to_response(username: String, auth_cookie: Result<AuthCookie, GenAuthCookieErr>, logger: &Sender<Log>, socket_addr: Option<SocketAddr>, login: bool) -> Response<String> {
     let status_code = match auth_cookie.as_ref().err() {
-        Some(err) => match err {
-            GenAuthCookieErr::UserDoesntExist => StatusCode::UNAUTHORIZED,
-            GenAuthCookieErr::DbErr(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            GenAuthCookieErr::BincodeErr(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        Some(err) => {
+            Log::new(
+                Some(username.clone()), 
+                socket_addr.unwrap().ip(),
+                match err {
+                    GenAuthCookieErr::UserDoesntExist => match login {
+                        true => Event::Login { success: false },
+                        false => Event::Registration { success: false }, 
+                    },
+                    GenAuthCookieErr::DbErr(_) => Event::ServerError,
+                    GenAuthCookieErr::BincodeErr(_) => Event::ServerError,
+                },
+                LogType::Auth, 
+                format!("{:?}", err),
+                Priority::Low,
+            ).send(logger).await.unwrap();
+
+            match err {
+                GenAuthCookieErr::UserDoesntExist => StatusCode::UNAUTHORIZED,
+                GenAuthCookieErr::DbErr(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                GenAuthCookieErr::BincodeErr(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            }
         },
-        None => StatusCode::OK,
+        None => {
+            Log::new(
+                Some(username.clone()), 
+                socket_addr.unwrap().ip(), 
+                match login {
+                    true => Event::Login { success: true },
+                    false => Event::Registration { success: true }, 
+                }, 
+                LogType::Auth, 
+                String::new(),
+                Priority::Low,
+            ).send(logger).await.unwrap();
+
+            StatusCode::OK
+        },
     };
 
     match auth_cookie {
@@ -330,7 +375,7 @@ pub(crate) fn destroy_expired_auth_cookies(auth_cookie_db: CookieDB) {
 			}
 		});
 
-		sleep(Duration::from_secs(1));
+		sleep(Duration::from_secs(3));
 
 	}
 
@@ -370,5 +415,26 @@ fn invalid_user_reason(username: &str) -> Option<InvalidUserReason> {
 
     }
    
+
+}
+
+
+fn hash_password(password: &[u8], salt: &[u8; 32]) -> [u8; blake3::OUT_LEN] {
+    let mut bytes_to_hash = Vec::with_capacity(password.len() + salt.len());
+    
+    bytes_to_hash.extend_from_slice(password);
+    bytes_to_hash.extend_from_slice(salt);
+
+    let hash = blake3::hash(&bytes_to_hash);
+    hash.try_into().unwrap()
+
+}
+
+fn verify_hash(password: &[u8], hash: &[u8; blake3::OUT_LEN]) -> bool {
+    let salt = &hash[0..32];
+    let auth_hash = hash_password(password, salt.try_into().unwrap());
+
+
+    auth_hash == *hash
 
 }

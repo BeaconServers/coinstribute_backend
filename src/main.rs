@@ -1,9 +1,10 @@
 mod auth;
 mod db;
-mod fundraiser;
 mod money;
+mod logging;
 
 use std::convert::Infallible;
+use std::time::Duration;
 use std::error::Error;
 use std::sync::{Arc, atomic::AtomicU64};
 
@@ -19,10 +20,10 @@ use warp::http::StatusCode;
 use auth::*;
 use db::*;
 use money::*;
-use fundraiser::*;
+use logging::*;
 
 static WALLET_RPC_ADDR: Lazy<String> = Lazy::new(|| String::from("http://127.0.0.1:19000"));
-static DAEMON_ADDR: Lazy<String> = Lazy::new(|| String::from("http://node.moneroworld.com:18089"));
+static DAEMON_ADDR: Lazy<String> = Lazy::new(|| String::from("http://127.0.0.1:18081"));
 
 static WALLET: OnceCell<Wallet> = OnceCell::new();
 
@@ -42,18 +43,15 @@ fn main() {
     let auth_db = AuthDB::new(db.open_tree(b"auth_db").expect("Failed to open authorization tree, time to panic!"));
     let cookie_db = CookieDB::new(db.open_tree(b"cookie_db").expect("Failed to open cookie tree, time to panic!"));
     let money_db = MoneyDB::new(db.open_tree(b"money_db").expect("Failed to open money tree, oh no"));
-    let fundraiser_db = FundraiserDB::new(db.open_tree(b"fundraiser_db").expect("Failed to open fundraiser tree, time to panic!"));
-    let current_fundraiser_id_db = CurrentFundraiserIdDB::new(db.open_tree(b"current_fundraiser_id_db").expect("Failed to initialize current fundraiser ID"));
     let all_transfers: Arc<RwLock<Vec<Transfers>>> = Arc::new(RwLock::new(Vec::new()));
     let (monero_sender, monero_tx_rcv) = mpsc::unbounded_channel::<TransferReq>();
+    let (log_send, log_rcv) = mpsc::channel::<Log>(200);
 
-    let current_fundraiser_id: Arc<AtomicU64> = Arc::new(AtomicU64::new(match current_fundraiser_id_db.get(&String::from("current_id")).unwrap() {
-        Some(id) => id,
-        None => {
-            current_fundraiser_id_db.insert(&String::from("current_id"), &0).unwrap();
-            0
-        }
-    }));
+    let pub_addr = wallet().address();
+
+    let addr =  monero::util::address::Address::subaddress(monero::network::Network::Mainnet, pub_addr.public_spend, pub_addr.public_view);
+
+    println!("{}", addr);
 
     let auth_db = warp::any().map(move || auth_db.clone());
     let cookie_db_filter = {
@@ -64,15 +62,16 @@ fn main() {
         let money_db_clone = money_db.clone();
         warp::any().map(move || money_db_clone.clone())
     };
-    let fundraiser_db_filter = warp::any().map(move || fundraiser_db.clone());
     let wallet_filter = warp::any().map(wallet);
-    let current_fundraiser_id_filter = warp::any().map(move || current_fundraiser_id.clone());
-    let current_fundraiser_id_db_filter = warp::any().map(move || current_fundraiser_id_db.clone());
     let cached_fee_filter = {
         let cached_fee = cached_fee.clone();
         warp::any().map(move || cached_fee.clone())
     };
     let monero_send_filter = warp::any().map(move || monero_sender.clone());
+    let log_filter = {
+        let log_send = log_send.clone();
+        warp::any().map(move || log_send.clone())
+    };
 
     let cors = warp::cors()
         .allow_any_origin()
@@ -86,6 +85,8 @@ fn main() {
         .and(auth_db.clone())
         .and(money_db_filter.clone())
         .and(cookie_db_filter.clone())
+        .and(warp::addr::remote())
+        .and(log_filter.clone())
         .and_then(register);
 
     let login = warp::path("login")
@@ -94,6 +95,8 @@ fn main() {
         .and(warp::body::json())
         .and(auth_db.clone())
         .and(cookie_db_filter.clone())
+        .and(warp::addr::remote())
+        .and(log_filter.clone())
         .and_then(login);
 
     let deposit_req = warp::path("deposit_req")
@@ -104,6 +107,8 @@ fn main() {
         .and(money_db_filter.clone())
         .and(wallet_filter)
         .and(cached_fee_filter.clone())
+        .and(warp::addr::remote())
+        .and(log_filter.clone())
         .and_then(deposit_req);
 
     let get_balance = warp::path("get_balance")
@@ -112,6 +117,8 @@ fn main() {
         .and(auth_db.clone())
         .and(money_db_filter.clone())
         .and(cookie_db_filter.clone())
+        .and(warp::addr::remote())
+        .and(log_filter.clone())
         .and_then(get_balance);
 
     let server_profits = warp::path("server_profits")
@@ -126,7 +133,9 @@ fn main() {
         .and(money_db_filter.clone())
         .and(auth_db.clone())
         .and(cookie_db_filter.clone())
-        .map(attach_xmr_address);
+        .and(warp::addr::remote())
+        .and(log_filter.clone())
+        .and_then(attach_xmr_address);
 
     let withdraw_monero = warp::path("withdraw_xmr")
         .and(warp::body::content_length_limit(2048))
@@ -136,24 +145,9 @@ fn main() {
         .and(money_db_filter.clone())
         .and(cached_fee_filter)
         .and(monero_send_filter)
+        .and(warp::addr::remote())
+        .and(log_filter.clone())
         .and_then(withdraw_monero);
-
-    let create_fundraiser = warp::path("create_fundraiser")
-        .and(warp::body::content_length_limit(2048))
-        .and(warp::body::json())
-        .and(auth_db)
-        .and(cookie_db_filter)
-        .and(fundraiser_db_filter.clone())
-        .and(money_db_filter)
-        .and(current_fundraiser_id_db_filter)
-        .and(current_fundraiser_id_filter)
-        .map(create_fundraiser);
-
-    let search_fundraisers = warp::path("search_fundraisers")
-        .and(warp::body::content_length_limit(2048))
-        .and(warp::body::json())
-        .and(fundraiser_db_filter)
-        .map(search_fundraisers);
 
     let post_routes = warp::post()
         .and(
@@ -163,8 +157,6 @@ fn main() {
             .or(attach_xmr_address)
             .or(get_balance)
             .or(withdraw_monero)
-            .or(create_fundraiser)
-            .or(search_fundraisers)
             .or(server_profits)
         );
 
@@ -188,9 +180,10 @@ fn main() {
 
 
     tokio_rt.spawn(update_transfers(wallet(), all_transfers.clone(), money_db.clone()));
-    tokio_rt.spawn(update_acc_balances(money_db.clone(), wallet(), all_transfers));
+    tokio_rt.spawn(update_acc_balances(money_db.clone(), wallet(), all_transfers, log_send.clone()));
     tokio_rt.spawn(update_cached_fee(cached_fee, wallet()));
     tokio_rt.spawn(send_monero(wallet(), monero_tx_rcv, money_db));
+    tokio_rt.spawn(logging_service(log_rcv));
     tokio_rt.spawn_blocking(move || destroy_expired_auth_cookies(cookie_db));
 
     tokio_rt.block_on(warp::serve(post_routes.with(cors).recover(handle_rejection)).run(([127, 0, 0, 1], 3030)));

@@ -1,6 +1,5 @@
 use crate::auth::{AuthCookie, User};
 use crate::money::FinancialInfo;
-use crate::fundraiser::Fundraiser;
 
 use sled::{Result, Tree, Batch};
 use serde::Serialize;
@@ -13,11 +12,7 @@ pub struct CookieDB(pub Tree);
 #[derive(Clone)]
 pub struct MoneyDB(Tree);
 #[derive(Clone)]
-pub struct FundraiserDB(pub Tree);
-#[derive(Clone)]
 pub struct CurrentPaymentIdDB(pub Tree);
-#[derive(Clone)]
-pub struct CurrentFundraiserIdDB(pub Tree);
 
 pub trait DB<K: serde::Serialize + DeserializeOwned, V: Serialize + DeserializeOwned> {
     fn new(tree: Tree) -> Self;
@@ -143,16 +138,6 @@ impl DB<String, FinancialInfo> for MoneyDB {
     }
 }
 
-impl DB<String, Fundraiser> for FundraiserDB {
-    fn new(tree: Tree) -> Self {
-        Self(tree)
-    }
-
-    fn get_tree(&self) -> &Tree {
-        &self.0
-    }
-}
-
 impl DB<String, u64> for CurrentPaymentIdDB {
     fn new(tree: Tree) -> Self {
         Self(tree)
@@ -163,13 +148,3 @@ impl DB<String, u64> for CurrentPaymentIdDB {
     }
 }
 
-
-impl DB<String, u64> for CurrentFundraiserIdDB {
-    fn new(tree: Tree) -> Self {
-        Self(tree)
-    }
-
-    fn get_tree(&self) -> &Tree {
-        &self.0
-    }
-}

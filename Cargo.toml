@@ -5,7 +5,6 @@ version = "0.1.0"
 edition = "2021"
 
 [profile.dev]
-overflow-checks = false
 debug = 0
 
 [profile.release]
@@ -16,6 +15,11 @@ lto = "fat"
 panic = "abort"
 debug = 0
 codegen-units = 1
+
+[profile.flamegraph]
+inherits = "release"
+debug = true
+strip = false
 
 [profile.dev.package."*"]
 opt-level = 3
@@ -34,17 +38,18 @@ sled = { version = "0.34", features = ["miri_optimizations"] }
 # Multi-threaded async runtime
 tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread"] }
 # A very secure hashing library
-rust-argon2 = { version = "1" }
+blake3 = { version = "1" }
 # Random data generator
-rand = { version = "0.8", features = ["simd_support"] }
+rand = { version = "0.8" }
 # Easy parallel computation
 rayon = { version = "1" }
+# Captchas
+# TODO: Consider hCaptcha
+captcha = { version = "0.0.8" }
 # It's serde
 serde_derive = { version = "1" }
 serde = { version = "1" }
 # Very fast JSON Serialization/Deserialization
 simd-json = { version = "0.4", features = ["serde"] }
-# Faster Mutex then std's
-parking_lot = { version = "0.12", features = ["send_guard"] }
 # Library written by a cool guy for dealing with Monero wallet RPC
 monero_wallet = { path = "crates/monero_wallet" }
