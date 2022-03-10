@@ -138,6 +138,45 @@ pub async fn register(auth_req: AuthRequest, auth_db: AuthDB, money_db: MoneyDB,
 
             }
 
+            let captcha_hash = match hex_simd::decode_to_boxed_bytes(captcha_guess.hash.as_bytes()) {
+                Ok(captcha_hash) => captcha_hash,
+                Err(_err) =>  {                
+                    let denial = RequestDenial::new(
+                        DenialFault::User,
+                        "Invalid hex string".to_string(),
+                        String::new(),
+                    );
+
+                    return Ok(denial.into_response(StatusCode::BAD_REQUEST));
+
+                }
+
+            };
+            let correct_captcha = match captcha_db.get(captcha_hash.as_ref().try_into().unwrap()).unwrap() {
+                Some(captcha) => {
+                    if captcha_guess.answer == captcha.answer {
+                        captcha_db.remove(captcha_hash.as_ref().try_into().unwrap()).unwrap().unwrap();
+                        true
+
+                    } else {
+                        false
+
+                    }
+                },
+                None => false,
+            };
+
+            if !correct_captcha {
+                let denial = RequestDenial::new(
+                    DenialFault::User, 
+                    String::from("Incorrect captcha"),
+                    String::new()
+                );
+
+                return Ok(denial.into_response(StatusCode::UNAUTHORIZED));
+            }
+
+
             let mut salt: [u8; 32] = [0; 32];
             rand::thread_rng().fill_bytes(&mut salt);
 
@@ -186,7 +225,7 @@ pub async fn register(auth_req: AuthRequest, auth_db: AuthDB, money_db: MoneyDB,
 
             let cookie = generate_auth_cookie(&user.username, &auth_db, auth_cookie_db.clone());
 
-            Ok(auth_cookie_result_to_response(user.username, cookie, &logger, socket_addr, false, captcha_db, captcha_guess).await)
+            Ok(auth_cookie_result_to_response(user.username, cookie, &logger, socket_addr, false).await)
 
         }
     }};
@@ -228,13 +267,37 @@ pub(crate) async fn login(auth_req: AuthRequest, auth_db: AuthDB, auth_cookie_db
 
     let give_response = async move { match auth_db.get(&username).unwrap() {
         Some(user_info) => {
-            tokio::task::yield_now().await;
-            match verify_hash(password.as_bytes(), &user_info.salt, &user_info.hashed_password) {
+            let captcha_hash = hex_simd::decode_to_boxed_bytes(captcha_guess.hash.as_bytes()).unwrap();
+            let correct_captcha = match captcha_db.get(captcha_hash.as_ref().try_into().unwrap()).unwrap() {
+                Some(captcha) => {
+                    if captcha_guess.answer == captcha.answer {
+                        captcha_db.remove(captcha_hash.as_ref().try_into().unwrap()).unwrap().unwrap();
+                        true
+
+                    } else {
+                        false
+
+                    }
+                },
+                None => false,
+            };
+
+            if !correct_captcha {
+                let denial = RequestDenial::new(
+                    DenialFault::User, 
+                    String::from("Incorrect captcha"),
+                    String::new()
+                );
+
+                return Ok(denial.into_response(StatusCode::UNAUTHORIZED));
+            }
+
+            match tokio::task::spawn_blocking(move || verify_hash(password.as_bytes(), &user_info.salt, &user_info.hashed_password)).await.unwrap() {
                 // Login successful
                 true => {
                 	let auth_cookie = generate_auth_cookie(&username, &auth_db, auth_cookie_db.clone());
 
-                	Ok(auth_cookie_result_to_response(username, auth_cookie, &logger, socket_addr, true, captcha_db, captcha_guess).await)
+                	Ok(auth_cookie_result_to_response(username, auth_cookie, &logger, socket_addr, true).await)
 
                 },
                 false => {
@@ -294,30 +357,7 @@ fn generate_auth_cookie(username: &String, auth_db: &AuthDB, auth_cookie_db: Coo
 
 }
 
-async fn auth_cookie_result_to_response(username: String, auth_cookie: Result<AuthCookie, GenAuthCookieErr>, logger: &Sender<Log>, socket_addr: Option<SocketAddr>, login: bool, captcha_db: CaptchaDB, captcha_guess: CaptchaGuess) -> Response<String> {
-    // Don't bother trying to do the rest if the auth cookie is bad
-    let correct_captcha = match auth_cookie.as_ref().is_err() {
-        true => false,
-        false => {
-            let captcha_hash = hex_simd::decode_to_boxed_bytes(captcha_guess.hash.as_bytes()).unwrap();
-            match captcha_db.get(captcha_hash.as_ref().try_into().unwrap()).unwrap() {
-                Some(captcha) => {
-                    println!("{}", captcha.answer);
-                    if captcha_guess.answer == captcha.answer {
-                        captcha_db.remove(captcha_hash.as_ref().try_into().unwrap()).unwrap().unwrap();
-                        true
-
-                    } else {
-                        false
-
-                    }
-                },
-                None => false,
-            }
-
-        },
-    };
-
+async fn auth_cookie_result_to_response(username: String, auth_cookie: Result<AuthCookie, GenAuthCookieErr>, logger: &Sender<Log>, socket_addr: Option<SocketAddr>, login: bool) -> Response<String> {
     let status_code = match auth_cookie.as_ref().err() {
         Some(err) => {
             Log::new(
@@ -361,30 +401,18 @@ async fn auth_cookie_result_to_response(username: String, auth_cookie: Result<Au
 
     match auth_cookie {
         Ok(auth_cookie) => {
-            if correct_captcha {
-                let resp = AuthReqResponse {
-                    username,
-                    cookie: auth_cookie.cookie.clone(),
-                    exp_time: auth_cookie.expiration_time,
-                };
+            let resp = AuthReqResponse {
+                username,
+                cookie: auth_cookie.cookie.clone(),
+                exp_time: auth_cookie.expiration_time,
+            };
 
-                let json = simd_json::to_string(&resp).unwrap();
+            let json = simd_json::to_string(&resp).unwrap();
 
-                Response::builder()
-                    .status(status_code)
-                    .body(json)
-                    .unwrap()
-
-            } else {
-                let denial = RequestDenial::new(
-                    DenialFault::User, 
-                    String::from("Incorrect captcha"),
-                    String::new()
-                );
-
-                denial.into_response(StatusCode::UNAUTHORIZED)
-
-            }
+            Response::builder()
+                .status(status_code)
+                .body(json)
+                .unwrap()
 
         },
         Err(_err) => {
