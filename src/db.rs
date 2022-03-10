@@ -1,4 +1,4 @@
-use crate::auth::{AuthCookie, User};
+use crate::auth::{AuthCookie, User, GeneratedCaptcha};
 use crate::money::FinancialInfo;
 
 use sled::{Result, Tree, Batch};
@@ -13,6 +13,8 @@ pub struct CookieDB(pub Tree);
 pub struct MoneyDB(Tree);
 #[derive(Clone)]
 pub struct CurrentPaymentIdDB(pub Tree);
+#[derive(Clone)]
+pub struct CaptchaDB(pub Tree);
 
 pub trait DB<K: serde::Serialize + DeserializeOwned, V: Serialize + DeserializeOwned> {
     fn new(tree: Tree) -> Self;
@@ -148,3 +150,12 @@ impl DB<String, u64> for CurrentPaymentIdDB {
     }
 }
 
+impl DB<[u8; blake3::OUT_LEN], GeneratedCaptcha> for CaptchaDB {
+    fn new(tree: Tree) -> Self {
+        Self(tree)
+    }
+
+    fn get_tree(&self) -> &Tree {
+        &self.0
+    }
+}

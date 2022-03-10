@@ -36,6 +36,9 @@ name = "arrayvec"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8da52d66c7071e2e3fa2a1e5c6d088fec47b593032b254f5e980de8ea54454d6"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "autocfg"
@@ -144,9 +147,11 @@ checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
 name = "coinstribute"
 version = "0.1.0"
 dependencies = [
+ "arrayvec",
  "bincode",
  "blake3",
  "captcha",
+ "hex-simd",
  "monero",
  "monero_wallet",
  "once_cell",

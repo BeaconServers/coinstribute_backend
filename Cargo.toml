@@ -25,6 +25,8 @@ strip = false
 opt-level = 3
 
 [dependencies]
+# Stack allocated strings
+arrayvec = { version = "0.7", features = ["serde"] }
 # For easy binary serialization and deserialization
 bincode = { version = "1" }
 # Lots of Monero primitives to make workign with addresses easier
@@ -49,6 +51,8 @@ captcha = { version = "0.0.8" }
 # It's serde
 serde_derive = { version = "1" }
 serde = { version = "1" }
+# Very fast hex serialization/deserialization
+hex-simd = { version = "0.5" }
 # Very fast JSON Serialization/Deserialization
 simd-json = { version = "0.4", features = ["serde"] }
 # Library written by a cool guy for dealing with Monero wallet RPC

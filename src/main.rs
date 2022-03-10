@@ -43,6 +43,7 @@ fn main() {
     let auth_db = AuthDB::new(db.open_tree(b"auth_db").expect("Failed to open authorization tree, time to panic!"));
     let cookie_db = CookieDB::new(db.open_tree(b"cookie_db").expect("Failed to open cookie tree, time to panic!"));
     let money_db = MoneyDB::new(db.open_tree(b"money_db").expect("Failed to open money tree, oh no"));
+    let captcha_db = CaptchaDB::new(db.open_tree(b"captcha_db").expect("Failed to open captcha_db, time to panic!"));
     let all_transfers: Arc<RwLock<Vec<Transfers>>> = Arc::new(RwLock::new(Vec::new()));
     let (monero_sender, monero_tx_rcv) = mpsc::unbounded_channel::<TransferReq>();
     let (log_send, log_rcv) = mpsc::channel::<Log>(200);
@@ -61,6 +62,10 @@ fn main() {
     let money_db_filter = {
         let money_db_clone = money_db.clone();
         warp::any().map(move || money_db_clone.clone())
+    };
+    let captcha_db_filter = {
+        let captcha_db = captcha_db.clone();
+        warp::any().map(move || captcha_db.clone())
     };
     let wallet_filter = warp::any().map(wallet);
     let cached_fee_filter = {
@@ -87,6 +92,7 @@ fn main() {
         .and(cookie_db_filter.clone())
         .and(warp::addr::remote())
         .and(log_filter.clone())
+        .and(captcha_db_filter.clone())
         .and_then(register);
 
     let login = warp::path("login")
@@ -97,6 +103,7 @@ fn main() {
         .and(cookie_db_filter.clone())
         .and(warp::addr::remote())
         .and(log_filter.clone())
+        .and(captcha_db_filter.clone())
         .and_then(login);
 
     let deposit_req = warp::path("deposit_req")
@@ -149,6 +156,14 @@ fn main() {
         .and(log_filter.clone())
         .and_then(withdraw_monero);
 
+    let create_captcha = warp::path("create_captcha")
+        .and(captcha_db_filter.clone())
+        .map(create_captcha);
+
+    let view_captcha = warp::path!("view_captcha" / String)
+        .and(captcha_db_filter)
+        .map(view_captcha);
+
     let post_routes = warp::post()
         .and(
             register
@@ -158,6 +173,12 @@ fn main() {
             .or(get_balance)
             .or(withdraw_monero)
             .or(server_profits)
+        );
+
+    let get_routes = warp::get()
+        .and(
+            create_captcha
+            .or(view_captcha)
         );
 
     tokio_rt.spawn(async move {
@@ -185,8 +206,9 @@ fn main() {
     tokio_rt.spawn(send_monero(wallet(), monero_tx_rcv, money_db));
     tokio_rt.spawn(logging_service(log_rcv));
     tokio_rt.spawn_blocking(move || destroy_expired_auth_cookies(cookie_db));
+    tokio_rt.spawn_blocking(move || destroy_expired_captchas(captcha_db.clone()));
 
-    tokio_rt.block_on(warp::serve(post_routes.with(cors).recover(handle_rejection)).run(([127, 0, 0, 1], 3030)));
+    tokio_rt.block_on(warp::serve(post_routes.with(cors).or(get_routes).recover(handle_rejection)).run(([127, 0, 0, 1], 3030)));
 
 }
 
@@ -248,7 +270,6 @@ async fn handle_rejection(err: Rejection) -> Result<impl Reply, Infallible> {
         message: message.into(),
     });
 
-    println!("Rejection resp w code {code}");
     Ok(warp::reply::with_status(json, code))
 }
 

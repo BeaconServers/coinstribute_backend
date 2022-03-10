@@ -1,13 +1,14 @@
 use crate::logging::{Log, LogType, Event, Priority};
-use crate::db::{DB, AuthDB, CookieDB, MoneyDB};
+use crate::db::{DB, AuthDB, CaptchaDB, CookieDB, MoneyDB};
 
 use std::fmt::Display;
 use std::net::SocketAddr;
-use std::time::{SystemTime, Duration};
+use std::time::{SystemTime, Duration, UNIX_EPOCH};
 
 use rand::prelude::*;
 use rand::distributions::Alphanumeric;
 
+use arrayvec::ArrayString;
 use serde::{Serialize, Deserialize};
 use tokio::sync::mpsc::Sender;
 use warp::reply::Reply;
@@ -26,6 +27,8 @@ const MAX_USER_LEN: usize = 50;
 pub struct AuthRequest {
     username: String,
     password: String,
+    captcha_hash: ArrayString<{ 2 * blake3::OUT_LEN}>,
+    captcha_answer: String,
 
 }
 
@@ -87,9 +90,13 @@ impl From<bincode::Error> for GenAuthCookieErr {
     }
 }
 
-pub async fn register(user_info: AuthRequest, auth_db: AuthDB, money_db: MoneyDB, auth_cookie_db: CookieDB, socket_addr: Option<SocketAddr>, logger: Sender<Log>) -> Result<impl Reply, Rejection> {
-    let username = user_info.username.to_lowercase();
-    let password = user_info.password;
+pub async fn register(auth_req: AuthRequest, auth_db: AuthDB, money_db: MoneyDB, auth_cookie_db: CookieDB, socket_addr: Option<SocketAddr>, logger: Sender<Log>, captcha_db: CaptchaDB) -> Result<impl Reply, Rejection> {
+    let username = auth_req.username.to_lowercase();
+    let password = auth_req.password;
+    let captcha_guess = CaptchaGuess {
+        hash: auth_req.captcha_hash,
+        answer: auth_req.captcha_answer,
+    };
 
     let get_res = async move { match auth_db.contains_key(&username).unwrap() {
         true => {
@@ -179,7 +186,7 @@ pub async fn register(user_info: AuthRequest, auth_db: AuthDB, money_db: MoneyDB
 
             let cookie = generate_auth_cookie(&user.username, &auth_db, auth_cookie_db.clone());
 
-            Ok(auth_cookie_result_to_response(user.username, cookie, &logger, socket_addr, false).await)
+            Ok(auth_cookie_result_to_response(user.username, cookie, &logger, socket_addr, false, captcha_db, captcha_guess).await)
 
         }
     }};
@@ -193,9 +200,13 @@ pub async fn register(user_info: AuthRequest, auth_db: AuthDB, money_db: MoneyDB
     res
 }
 
-pub(crate) async fn login(user_info: AuthRequest, auth_db: AuthDB, auth_cookie_db: CookieDB, socket_addr: Option<SocketAddr>, logger: Sender<Log>) -> Result<impl Reply, Rejection> {
-    let username = user_info.username.to_lowercase();
-    let password = user_info.password;
+pub(crate) async fn login(auth_req: AuthRequest, auth_db: AuthDB, auth_cookie_db: CookieDB, socket_addr: Option<SocketAddr>, logger: Sender<Log>, captcha_db: CaptchaDB) -> Result<impl Reply, Rejection> {
+    let username = auth_req.username.to_lowercase();
+    let password = auth_req.password;
+    let captcha_guess = CaptchaGuess {
+        hash: auth_req.captcha_hash,
+        answer: auth_req.captcha_answer,
+    };
 
 
     let denial = RequestDenial::new(
@@ -218,11 +229,12 @@ pub(crate) async fn login(user_info: AuthRequest, auth_db: AuthDB, auth_cookie_d
     let give_response = async move { match auth_db.get(&username).unwrap() {
         Some(user_info) => {
             tokio::task::yield_now().await;
-            match verify_hash(password.as_bytes(), &user_info.hashed_password) {
+            match verify_hash(password.as_bytes(), &user_info.salt, &user_info.hashed_password) {
                 // Login successful
                 true => {
                 	let auth_cookie = generate_auth_cookie(&username, &auth_db, auth_cookie_db.clone());
-                	Ok(auth_cookie_result_to_response(username, auth_cookie, &logger, socket_addr, true).await)
+
+                	Ok(auth_cookie_result_to_response(username, auth_cookie, &logger, socket_addr, true, captcha_db, captcha_guess).await)
 
                 },
                 false => {
@@ -282,7 +294,30 @@ fn generate_auth_cookie(username: &String, auth_db: &AuthDB, auth_cookie_db: Coo
 
 }
 
-async fn auth_cookie_result_to_response(username: String, auth_cookie: Result<AuthCookie, GenAuthCookieErr>, logger: &Sender<Log>, socket_addr: Option<SocketAddr>, login: bool) -> Response<String> {
+async fn auth_cookie_result_to_response(username: String, auth_cookie: Result<AuthCookie, GenAuthCookieErr>, logger: &Sender<Log>, socket_addr: Option<SocketAddr>, login: bool, captcha_db: CaptchaDB, captcha_guess: CaptchaGuess) -> Response<String> {
+    // Don't bother trying to do the rest if the auth cookie is bad
+    let correct_captcha = match auth_cookie.as_ref().is_err() {
+        true => false,
+        false => {
+            let captcha_hash = hex_simd::decode_to_boxed_bytes(captcha_guess.hash.as_bytes()).unwrap();
+            match captcha_db.get(captcha_hash.as_ref().try_into().unwrap()).unwrap() {
+                Some(captcha) => {
+                    println!("{}", captcha.answer);
+                    if captcha_guess.answer == captcha.answer {
+                        captcha_db.remove(captcha_hash.as_ref().try_into().unwrap()).unwrap().unwrap();
+                        true
+
+                    } else {
+                        false
+
+                    }
+                },
+                None => false,
+            }
+
+        },
+    };
+
     let status_code = match auth_cookie.as_ref().err() {
         Some(err) => {
             Log::new(
@@ -326,18 +361,30 @@ async fn auth_cookie_result_to_response(username: String, auth_cookie: Result<Au
 
     match auth_cookie {
         Ok(auth_cookie) => {
-            let resp = AuthReqResponse {
-                username,
-                cookie: auth_cookie.cookie.clone(),
-                exp_time: auth_cookie.expiration_time,
-            };
+            if correct_captcha {
+                let resp = AuthReqResponse {
+                    username,
+                    cookie: auth_cookie.cookie.clone(),
+                    exp_time: auth_cookie.expiration_time,
+                };
 
-            let json = simd_json::to_string(&resp).unwrap();
+                let json = simd_json::to_string(&resp).unwrap();
 
-            Response::builder()
-                .status(status_code)
-                .body(json)
-                .unwrap()
+                Response::builder()
+                    .status(status_code)
+                    .body(json)
+                    .unwrap()
+
+            } else {
+                let denial = RequestDenial::new(
+                    DenialFault::User, 
+                    String::from("Incorrect captcha"),
+                    String::new()
+                );
+
+                denial.into_response(StatusCode::UNAUTHORIZED)
+
+            }
 
         },
         Err(_err) => {
@@ -378,6 +425,75 @@ pub(crate) fn destroy_expired_auth_cookies(auth_cookie_db: CookieDB) {
 		sleep(Duration::from_secs(3));
 
 	}
+
+}
+
+#[derive(Serialize)]
+struct CaptchaResp {
+    captcha_hash: ArrayString<{ 2 * blake3::OUT_LEN }>,
+
+}
+
+// TODO: Rate limit captcha generation
+pub fn create_captcha(captcha_db: CaptchaDB) -> Response<String> {
+    let captcha = captcha::gen(captcha::Difficulty::Medium);
+    let (captcha_answer, captcha_bytes) = captcha.as_tuple().unwrap();
+    let captcha_hash = blake3::hash(&captcha_bytes);
+    let captcha_hash_bytes = {
+        let mut captcha_hash_bytes = [0; blake3::OUT_LEN];
+        captcha_hash_bytes.copy_from_slice(captcha_hash.as_bytes());
+        captcha_hash_bytes
+    };
+    let captcha_hash_hex = captcha_hash.to_hex();
+
+    let creation_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+
+    let captcha = GeneratedCaptcha {
+        creation_time,
+        // Expires in 5 minutes
+        expiration_time: creation_time + 300,
+        answer: captcha_answer,
+        image: captcha_bytes,
+
+    };
+
+    captcha_db.insert(&captcha_hash_bytes, &captcha).unwrap();
+
+    let resp = CaptchaResp {
+        captcha_hash: captcha_hash_hex,
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .body(simd_json::to_string(&resp).unwrap())
+        .unwrap()
+    
+}
+
+pub fn view_captcha(hash: String, captcha_db: CaptchaDB) -> Response<Vec<u8>> {
+    if hash.len() != 2 * blake3::OUT_LEN {
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body("Image not found".into())
+            .unwrap();
+    }
+
+    let hash_bytes = hex_simd::decode_to_boxed_bytes(hash.as_bytes()).unwrap();
+    let captcha = captcha_db.get(hash_bytes.as_ref().try_into().unwrap()).unwrap();
+
+    match captcha {
+        Some(captcha) => Response::builder()
+              .header("content-type", "image/png")
+              .status(StatusCode::OK)
+              .body(captcha.image.clone()) 
+              .unwrap(),
+
+        None => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body("Image not found".into())
+            .unwrap()
+
+    }
 
 }
 
@@ -430,11 +546,39 @@ fn hash_password(password: &[u8], salt: &[u8; 32]) -> [u8; blake3::OUT_LEN] {
 
 }
 
-fn verify_hash(password: &[u8], hash: &[u8; blake3::OUT_LEN]) -> bool {
-    let salt = &hash[0..32];
-    let auth_hash = hash_password(password, salt.try_into().unwrap());
-
-
+fn verify_hash(password: &[u8], salt: &[u8; 32], hash: &[u8; blake3::OUT_LEN]) -> bool {
+    let auth_hash = hash_password(password, salt);
     auth_hash == *hash
 
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct GeneratedCaptcha {
+    creation_time: u64,
+    expiration_time: u64,
+    answer: String,
+    image: Vec<u8>,
+}
+
+
+struct CaptchaGuess {
+    hash: ArrayString<{2 * blake3::OUT_LEN}>,
+    answer: String,
+}
+
+pub fn destroy_expired_captchas(captcha_db: CaptchaDB) {
+    loop {
+        let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+
+        captcha_db.iter().for_each(|captcha| {
+            let (hash, captcha) = captcha.unwrap();
+            if time > captcha.expiration_time {
+                captcha_db.remove(&hash).unwrap().unwrap();
+
+            }
+        });
+
+        std::thread::sleep(Duration::from_secs(15))
+
+    }
 }
