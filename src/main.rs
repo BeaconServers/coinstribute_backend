@@ -1,5 +1,6 @@
 mod auth;
 mod db;
+mod software;
 mod money;
 mod logging;
 
@@ -11,13 +12,16 @@ use std::sync::{Arc, atomic::AtomicU64};
 use monero_wallet::{Transfers, Wallet};
 use once_cell::sync::{Lazy, OnceCell};
 use serde_derive::Serialize;
+
 use tokio::runtime::Runtime;
 use tokio::sync::{RwLock, mpsc};
+
 use warp::hyper::Response;
 use warp::{Filter, Rejection, Reply};
 use warp::http::StatusCode;
 
 use auth::*;
+use software::*;
 use db::*;
 use money::*;
 use logging::*;
@@ -44,15 +48,27 @@ fn main() {
     let cookie_db = CookieDB::new(db.open_tree(b"cookie_db").expect("Failed to open cookie tree, time to panic!"));
     let money_db = MoneyDB::new(db.open_tree(b"money_db").expect("Failed to open money tree, oh no"));
     let captcha_db = CaptchaDB::new(db.open_tree(b"captcha_db").expect("Failed to open captcha_db, time to panic!"));
+    let software_db = SoftwareDB::new(db.open_tree(b"software_db").expect("Failed to open software_db, time to panic!"));
+    let upload_id_db = UploadIdDB::new(db.open_tree(b"upload_id_db").expect("Failed to open upload_id_db, time to panic!"));
+
+
     let all_transfers: Arc<RwLock<Vec<Transfers>>> = Arc::new(RwLock::new(Vec::new()));
+    let current_software_id: Arc<AtomicU64> = Arc::new(AtomicU64::new(
+        match software_db.iter().map(|item| item.unwrap().0 ).max() {
+            Some(id) => id + 1,
+            None => {
+                println!("No software uploads found");
+                0
+            },
+        }
+    ));
+
     let (monero_sender, monero_tx_rcv) = mpsc::unbounded_channel::<TransferReq>();
     let (log_send, log_rcv) = mpsc::channel::<Log>(200);
 
     let pub_addr = wallet().address();
 
     let addr =  monero::util::address::Address::subaddress(monero::network::Network::Mainnet, pub_addr.public_spend, pub_addr.public_view);
-
-    println!("{}", addr);
 
     let auth_db = warp::any().map(move || auth_db.clone());
     let cookie_db_filter = {
@@ -62,6 +78,14 @@ fn main() {
     let money_db_filter = {
         let money_db_clone = money_db.clone();
         warp::any().map(move || money_db_clone.clone())
+    };
+    let software_db_filter = {
+        let software_db_clone = software_db.clone();
+        warp::any().map(move || software_db_clone.clone())
+    };
+    let upload_id_db_filter = {
+        let db = upload_id_db.clone();
+        warp::any().map(move || db.clone())
     };
     let captcha_db_filter = {
         let captcha_db = captcha_db.clone();
@@ -77,11 +101,15 @@ fn main() {
         let log_send = log_send.clone();
         warp::any().map(move || log_send.clone())
     };
+    let current_software_id_filter = {
+        let id = current_software_id.clone();
+        warp::any().map(move || id.clone())
+    };
 
     let cors = warp::cors()
         .allow_any_origin()
         .allow_methods(["POST", "GET", "PUT", "HEAD", "DELETE", "OPTIONS", "CONNECT", "PATCH", "TRACE"])
-        .allow_headers(["Content-Type"]);
+        .allow_headers(["Content-Type", "Sec-WebSocket-Protocol"]);
 
     let register = warp::path("signup")
         // 2 KB limit to username + password
@@ -156,6 +184,25 @@ fn main() {
         .and(log_filter.clone())
         .and_then(withdraw_monero);
 
+    let new_software = warp::path("new_software")
+        .and(warp::body::content_length_limit(2048))
+        .and(warp::body::json())
+        .and(auth_db.clone())
+        .and(cookie_db_filter.clone())
+        .and(software_db_filter.clone())
+        .and(upload_id_db_filter.clone())
+        .and(captcha_db_filter.clone())
+        .and(current_software_id_filter.clone())
+        .map(new_software);
+
+    let upload_software = warp::path("upload_software")
+        .and(warp::ws())
+        .and(auth_db.clone())
+        .and(cookie_db_filter.clone())
+        .and(upload_id_db_filter.clone())
+        .and(software_db_filter.clone())
+        .and_then(upload_software);
+
     let create_captcha = warp::path("create_captcha")
         .and(captcha_db_filter.clone())
         .map(create_captcha);
@@ -173,6 +220,7 @@ fn main() {
             .or(get_balance)
             .or(withdraw_monero)
             .or(server_profits)
+            .or(new_software)
         );
 
     let get_routes = warp::get()
@@ -208,7 +256,7 @@ fn main() {
     tokio_rt.spawn_blocking(move || destroy_expired_auth_cookies(cookie_db));
     tokio_rt.spawn_blocking(move || destroy_expired_captchas(captcha_db.clone()));
 
-    tokio_rt.block_on(warp::serve(post_routes.with(cors).or(get_routes).recover(handle_rejection)).run(([127, 0, 0, 1], 3030)));
+    tokio_rt.block_on(warp::serve(post_routes.with(cors.clone()).or(upload_software.with(cors.clone())).or(get_routes.with(cors)).recover(handle_rejection)).run(([127, 0, 0, 1], 3030)));
 
 }
 

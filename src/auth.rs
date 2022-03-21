@@ -118,6 +118,21 @@ pub async fn register(auth_req: AuthRequest, auth_db: AuthDB, money_db: MoneyDB,
             Ok(login_req_denial.into_response(StatusCode::CONFLICT))
         },
         false => {
+            let captcha_hash = match hex_simd::decode_to_boxed_bytes(captcha_guess.hash.as_bytes()) {
+                  Ok(captcha_hash) => captcha_hash,
+                  Err(_err) =>  {
+                      let denial = RequestDenial::new(
+                          DenialFault::User,
+                          "Invalid hex string".to_string(),
+                          String::new(),
+                      );
+
+                      return Ok(denial.into_response(StatusCode::BAD_REQUEST));
+
+                  }
+
+              };
+
             if let Some(reason) = invalid_user_reason(&username) {
                 let login_req_denial = RequestDenial::new(
                     DenialFault::User,
@@ -138,20 +153,6 @@ pub async fn register(auth_req: AuthRequest, auth_db: AuthDB, money_db: MoneyDB,
 
             }
 
-            let captcha_hash = match hex_simd::decode_to_boxed_bytes(captcha_guess.hash.as_bytes()) {
-                Ok(captcha_hash) => captcha_hash,
-                Err(_err) =>  {                
-                    let denial = RequestDenial::new(
-                        DenialFault::User,
-                        "Invalid hex string".to_string(),
-                        String::new(),
-                    );
-
-                    return Ok(denial.into_response(StatusCode::BAD_REQUEST));
-
-                }
-
-            };
             let correct_captcha = match captcha_db.get(captcha_hash.as_ref().try_into().unwrap()).unwrap() {
                 Some(captcha) => {
                     if captcha_guess.answer == captcha.answer {
@@ -439,6 +440,7 @@ pub(crate) fn destroy_expired_auth_cookies(auth_cookie_db: CookieDB) {
 				if current_time > auth_cookie.expiration_time {
 					// The cookie has expired, so it must be removed
 					auth_cookie_db.remove(&username).unwrap_or_else(|error| {
+                        //TODO: LOG THIS
                         eprintln!("Error reading auth_cookie db: {error:?}");
                         None
                     });
@@ -584,7 +586,7 @@ fn verify_hash(password: &[u8], salt: &[u8; 32], hash: &[u8; blake3::OUT_LEN]) -
 pub struct GeneratedCaptcha {
     creation_time: u64,
     expiration_time: u64,
-    answer: String,
+    pub answer: String,
     image: Vec<u8>,
 }
 

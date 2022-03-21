@@ -1,4 +1,6 @@
+// Generics babyyyyyyyyy
 use crate::auth::{AuthCookie, User, GeneratedCaptcha};
+use crate::software::Item;
 use crate::money::FinancialInfo;
 
 use sled::{Result, Tree, Batch};
@@ -15,6 +17,10 @@ pub struct MoneyDB(Tree);
 pub struct CurrentPaymentIdDB(pub Tree);
 #[derive(Clone)]
 pub struct CaptchaDB(pub Tree);
+#[derive(Clone)]
+pub struct SoftwareDB(pub Tree);
+#[derive(Clone)]
+pub struct UploadIdDB(pub Tree);
 
 pub trait DB<K: serde::Serialize + DeserializeOwned, V: Serialize + DeserializeOwned> {
     fn new(tree: Tree) -> Self;
@@ -159,3 +165,24 @@ impl DB<[u8; blake3::OUT_LEN], GeneratedCaptcha> for CaptchaDB {
         &self.0
     }
 }
+
+impl DB<u64, Item> for SoftwareDB {
+    fn new(tree: Tree) -> Self {
+        Self(tree)
+    }
+
+    fn get_tree(&self) -> &Tree {
+        &self.0
+    }
+}
+
+impl DB<[u8; blake3::OUT_LEN], u64> for UploadIdDB {
+    fn new(tree: Tree) -> Self {
+        Self(tree)
+    }
+
+    fn get_tree(&self) -> &Tree {
+        &self.0
+    }
+}
+

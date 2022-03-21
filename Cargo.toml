@@ -31,16 +31,19 @@ arrayvec = { version = "0.7", features = ["serde"] }
 bincode = { version = "1" }
 # Lots of Monero primitives to make workign with addresses easier
 monero = { version = "0.16", default-features = false, features = ["serde_support"] }
+# Useful async lib
+futures = { version = "0.3", default-features = false}
 # Lazy initialization of globals
 once_cell = { version = "1" }
 # Very fast HTTP server library
-warp = { version = "0.3", default-features = false }
+warp = { version = "0.3", default-features = false, features = ["websocket"] }
 # Very fast database library
 sled = { version = "0.34", features = ["miri_optimizations"] }
 # Multi-threaded async runtime
 tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread"] }
+tokio-stream = { version = "0.1" }
 # A very secure hashing library
-blake3 = { version = "1" }
+blake3 = { version = "1" , features = ["rayon"] }
 # Random data generator
 rand = { version = "0.8" }
 # Easy parallel computation
@@ -51,9 +54,15 @@ captcha = { version = "0.0.8" }
 # It's serde
 serde_derive = { version = "1" }
 serde = { version = "1" }
+# Decimals
+rust_decimal = { version = "1", features = ["serde"] }
+rust_decimal_macros = { version = "1" }
 # Very fast hex serialization/deserialization
 hex-simd = { version = "0.5" }
 # Very fast JSON Serialization/Deserialization
 simd-json = { version = "0.4", features = ["serde"] }
+# Compression library
+async-compression = { version = "0.3", default-features = false, features = ["zstd", "tokio"] }
+
 # Library written by a cool guy for dealing with Monero wallet RPC
 monero_wallet = { path = "crates/monero_wallet" }

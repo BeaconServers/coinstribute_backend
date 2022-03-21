@@ -414,12 +414,7 @@ pub async fn withdraw_monero(withdraw_req: WithdrawMoneroReq, auth_db: AuthDB, c
 
 	} else {
 		let denial = RequestDenial::new(DenialFault::User, String::from("Invalid username or cookie"), String::new());
-		let json = simd_json::to_string(&denial).unwrap();
-
-		Ok(Response::builder()
-			.status(StatusCode::UNAUTHORIZED)
-			.body(json)
-			.unwrap())
+		Ok(denial.into_response(StatusCode::UNAUTHORIZED))
 
 	}
 
