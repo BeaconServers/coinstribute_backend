@@ -10,6 +10,7 @@ use arrayvec::ArrayString;
 use blake3::Hash;
 use futures::{FutureExt, StreamExt};
 use rand::prelude::*;
+use rayon::iter::IntoParallelIterator;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncWriteExt, BufWriter, AsyncReadExt};
@@ -48,7 +49,6 @@ pub struct CreateSoftwareReq {
 	compressed_size: u64,
 	price: ItemPrice,
 	compression_type: CompressionType,
-	compressed_software_hash: ArrayString<{ 2 * blake3::OUT_LEN }>,
 	captcha_hash: ArrayString<{ 2 * blake3::OUT_LEN }>,
 	captcha_answer: String,
 
@@ -104,29 +104,6 @@ pub fn new_software(new_software_req: CreateSoftwareReq, auth_db: AuthDB, cookie
 
 	}
 
-	let compressed_hash = match hex_simd::decode_to_boxed_bytes(new_software_req.compressed_software_hash.as_bytes()) {
-		Ok(hash) => {
-			match hash.len() == 32 {
-				true => {
-					let mut hash_array: [u8; blake3::OUT_LEN] = [0; blake3::OUT_LEN];
-					hash_array.copy_from_slice(&hash);
-
-					hash_array
-				},
-				false => {
-					let denial = RequestDenial::new(DenialFault::User, "Invalid hex string".to_string(), String::new());
-					return denial.into_response(StatusCode::UNAUTHORIZED);
-				}
-
-			}
-
-		},
-		Err(_err) => {
-			let denial = RequestDenial::new(DenialFault::User, "Invalid hex string".to_string(), String::new());
-			return denial.into_response(StatusCode::UNAUTHORIZED);
-		},
-	};
-
 	let software_id = current_soft_id.fetch_add(1, Ordering::Relaxed);
 	let mut random_bytes: [u8; 32] = [0; 32];
 
@@ -139,11 +116,10 @@ pub fn new_software(new_software_req: CreateSoftwareReq, auth_db: AuthDB, cookie
 	bytes_to_hash.extend_from_slice(new_software_req.username.as_bytes());
 
 	// Basically just a way of generating a pretty random ID
-	let upload_id_bytes = blake3::hash(&bytes_to_hash);
-	let upload_id_hex = hex_simd::encode_to_boxed_str(upload_id_bytes.as_bytes(), hex_simd::AsciiCase::Lower);
+	let upload_id_hash = blake3::hash(&bytes_to_hash);
+    let upload_id_bytes = *upload_id_hash.as_bytes();
 
-	let mut upload_id_str = ArrayString::new();
-	upload_id_str.push_str(&upload_id_hex);
+    let upload_id_str = upload_id_hash.to_hex();
 
 	let game = Item {
 	    id: software_id,
@@ -154,12 +130,12 @@ pub fn new_software(new_software_req: CreateSoftwareReq, auth_db: AuthDB, cookie
 	    compression_type: new_software_req.compression_type,
 	    compressed_size: new_software_req.compressed_size,
 	    price: new_software_req.price,
-	    compressed_hash,
-	    upload_id: Some(upload_id_str),
+	    files: HashMap::new(),
+	    upload_id: Some(upload_id_bytes),
 	};
 
 	software_db.insert(&software_id, &game).unwrap();
-	upload_id_db.insert(upload_id_bytes.as_bytes(), &software_id).unwrap();
+	upload_id_db.insert(&upload_id_bytes, &software_id).unwrap();
 
 	let resp = NewSoftwareResp {
 		upload_id: upload_id_str,
@@ -172,7 +148,8 @@ pub fn new_software(new_software_req: CreateSoftwareReq, auth_db: AuthDB, cookie
 	
 }
 
-pub async fn upload_software(websocket: warp::ws::Ws, auth_db: AuthDB, cookie_db: CookieDB, upload_id_db: UploadIdDB, _software_db: SoftwareDB) -> Result<impl Reply, Rejection >{
+// TODO: Replace all the sudden disconnects with sending errors back to the client
+pub async fn upload_software(websocket: warp::ws::Ws, auth_db: AuthDB, cookie_db: CookieDB, upload_id_db: UploadIdDB, software_db: SoftwareDB) -> Result<impl Reply, Rejection >{
 	Ok(websocket.on_upgrade(|ws| async move {
 		let (cli_ws_snd, mut cli_ws_rcv) = ws.split();
 		let (_cli_snd, cli_rcv) = mpsc::unbounded_channel();
@@ -190,8 +167,9 @@ pub async fn upload_software(websocket: warp::ws::Ws, auth_db: AuthDB, cookie_db
         let mut num_chunks = 0;
         let mut amt_written_to_buffer = 0;
 		let mut chunk_info: Option<ChunkInfo> = None;
+
         const CHUNK_BUFFER_LEN: usize = 65535;
-	    let mut chunk_buffer: [u8; CHUNK_BUFFER_LEN] = [0; CHUNK_BUFFER_LEN];
+	    let mut chunk_buffer = [0_u8; CHUNK_BUFFER_LEN]; 
 
 	    while let Some(result) = cli_ws_rcv.next().await {
 	        let _msg = match result {
@@ -200,20 +178,17 @@ pub async fn upload_software(websocket: warp::ws::Ws, auth_db: AuthDB, cookie_db
 
 	            	if let Some(software_info) = software_info.as_ref() {
                         if num_chunks == software_info.num_chunks {
-                            let mut path = PathBuf::new();
-                            path.push(".local/share/coinstribute/");
-                            
-                            for (hash, file) in software_info.files.iter() {
-                                let mut path = PathBuf::new();
-                                path.push(".cache/coinstribute/");
-                                path.push(&hash.to_string());
+                            for (hash, _file) in software_info.files.iter() {
+                                let mut src_path = PathBuf::new();
+                                src_path.push(".cached_files/");
+                                src_path.push(&hash.to_string());
 
                                 let mut source = None;
 
                                 while source.is_none() {
                                     tokio::time::sleep(Duration::from_secs(1)).await;
 
-                                    source = match tokio::fs::OpenOptions::new().read(true).open(&path).await {
+                                    source = match tokio::fs::OpenOptions::new().read(true).open(&src_path).await {
                                             Ok(source) => Some(source),
                                             Err(err) => {
                                                 println!("Error on file read: {err:?}");
@@ -227,70 +202,57 @@ pub async fn upload_software(websocket: warp::ws::Ws, auth_db: AuthDB, cookie_db
 
                                 let source = source.unwrap();
 
-                                let dst = tokio::fs::OpenOptions::new()
-                                    .write(true)
-                                    .create(true)
-                                    .open(&file)
-                                    .await
-                                    .unwrap();
+                                let mut dst_path = PathBuf::new();
+                                dst_path.push(".game_files/");
+                                tokio::fs::create_dir_all(&dst_path).await.unwrap();
 
-                                let mut zstd = ZstdDecoder::new(dst);
+                                dst_path.push(&hash.to_string());
 
                                 // Before decompressing, check the hash of the file
 
                                 let mut hasher = blake3::Hasher::new();
-                                let hash_buffer = &mut chunk_buffer;
                                 let mut file_src = BufReader::new(source);
-                                let mut pos = 0;
+                                let buffer = &mut chunk_buffer;
                                 
                                 loop {
-                                    let num_bytes_read = file_src.read(&mut hash_buffer[pos..]).await.unwrap();
-
-                                    if num_bytes_read > 0 {
-                                        pos += num_bytes_read; 
-
-                                        if pos == hash_buffer.len() {
-                                            tokio::task::block_in_place(|| hasher.update_rayon(&hash_buffer[..]));
-                                            pos = 0;
-
-                                        }
-
-                                    // If num bytes read is 0, that means we've finished
-                                    // reading from the file
-                                    } else {
-                                        tokio::task::block_in_place(|| hasher.update(&hash_buffer[..pos]));
-                                        break;
-
-                                    }
-
-
+                                    match file_src.read(buffer).await {
+                                        Ok(0) => break,
+                                        Ok(n) => hasher.update(&buffer[..n]),
+                                        Err(ref e) if e.kind() == tokio::io::ErrorKind::Interrupted => continue,
+                                        Err(e) => panic!("{}", e),
+                                    };
                                 }
-
+                                
                                 let computed_hash = hasher.finalize();
 
-                                // TODO: Remove the whole cached folder, not just the single
                                 // corrupted file
-                                let remove_cached_file = || async { tokio::fs::remove_file(&path).await.unwrap() };
+                                let remove_cached_files = || async { tokio::fs::remove_file(&src_path).await.unwrap() };
 
                                 if *hash == computed_hash {
-
                                     println!("Hashes are equivalent");
 
                                 } else {
-                                    remove_cached_file().await;
+                                    remove_cached_files().await;
                                     panic!("Hash: {}\nComputed Hash: {}", hash, computed_hash);
 
                                 }
 
-                                let source = tokio::fs::OpenOptions::new().read(true).open(&path).await.unwrap(); 
+                                tokio::fs::copy(&src_path, &dst_path).await.unwrap();
+                                remove_cached_files().await;
 
-                                let mut src = BufReader::new(source.try_clone().await.unwrap());
-
-                                tokio::io::copy_buf(&mut src, &mut zstd).await.unwrap();
-                                remove_cached_file().await;
+                                println!("Finished writing");
 
                             }
 
+                            // When all of the files are properly checksummed, finish up.
+                            let software_id = upload_id_db.get(&software_info.upload_id).unwrap().unwrap();
+                            let mut software_item = software_db.get(&software_id).unwrap().unwrap();
+
+                            software_item.files = software_info.files.iter().map(|(k, v)| (*k.as_bytes(), v.clone())).collect();
+
+                            software_db.insert(&software_id, &software_item).unwrap();
+
+                            println!("Added software");
                             break;
 
                         }
@@ -304,13 +266,11 @@ pub async fn upload_software(websocket: warp::ws::Ws, auth_db: AuthDB, cookie_db
                             if amt_written_to_buffer_as_u64 == chunk_info_ref.len {
                                 // When we've finished writing a single chunk to memory, begin
                                 // writing it to disk
-                                let chunk_buffer_clone = chunk_buffer;
                                 let file_hash = chunk_info_ref.file;
-
                                 tokio::task::spawn(async move {
-                                    let chunk_buffer = &chunk_buffer_clone[..amt_written_to_buffer];
+                                    let chunk_buffer = &chunk_buffer[..amt_written_to_buffer];
                                     let mut path = PathBuf::new();
-                                    path.push(".cache/coinstribute/");
+                                    path.push(".cached_files/");
 
                                     tokio::fs::create_dir_all(path.clone()).await.unwrap();
                                     path.push(&file_hash.to_string());
@@ -322,15 +282,15 @@ pub async fn upload_software(websocket: warp::ws::Ws, auth_db: AuthDB, cookie_db
                                         .unwrap();
                                    
                                     file.write_all(chunk_buffer).await.unwrap();
-
+                                    file.flush().await.unwrap();
+                                    file.shutdown().await.unwrap();
                                 });
 
+
                                 // Reset the chunk buffer stuff
-                                chunk_buffer = [0; CHUNK_BUFFER_LEN];
                                 amt_written_to_buffer = 0;
                                 chunk_info = None;
 
-                                // TODO: Only increment num_chunks if the file is fully written
                                 num_chunks += 1;
 
                             }
@@ -349,28 +309,58 @@ pub async fn upload_software(websocket: warp::ws::Ws, auth_db: AuthDB, cookie_db
 	            	} else {
 	            		let software_info_bytes = &msg;
 
-	            		//TODO: Super easy way to crash server here
 	            		let num_chunks = u64::from_le_bytes(software_info_bytes[0..8].try_into().unwrap());
+                        let (username, username_end_index) = {
+                            let username_end_index: usize = software_info_bytes[8..].iter().position(|b| *b == 0).unwrap() + 8;
+                            (String::from_utf8(software_info_bytes[8..username_end_index].to_vec()), username_end_index)
+
+                        };
+                        let username = match username {
+                            Ok(username) => username,
+                            Err(_err) => {
+                                eprintln!("Invalid username");
+                                break
+                            },
+
+                        };
+
+                        
 	            		let (auth_cookie, cookie_end_index) = {
-	            			let auth_cookie_end_index: usize = software_info_bytes[8..].iter().position(|b| *b == 0).unwrap() + 8;
-                            (String::from_utf8(software_info_bytes[8..auth_cookie_end_index].to_vec()), auth_cookie_end_index)
+	            			let auth_cookie_end_index: usize = software_info_bytes[username_end_index + 1..].iter().position(|b| *b == 0).unwrap() + username_end_index + 1;
+                            (String::from_utf8(software_info_bytes[username_end_index + 1..auth_cookie_end_index].to_vec()), auth_cookie_end_index)
 	            		};
-                        let auth_cookie = auth_cookie.unwrap();
 
-                        let (upload_id, id_end_index) = {
-                            let end_index: usize = (software_info_bytes[cookie_end_index + 1..]).iter().position(|b| *b == 0).unwrap();
-                            
+                        let auth_cookie = match auth_cookie {
+                            Ok(cookie) => {
+                                match verify_auth_cookie(&username, &cookie, &cookie_db) {
+                                    true => cookie,
+                                    false => {
+                                        eprintln!("Invalid auth cookie");
+                                        break;
+                                    },
+                                }
+                            },
+                            Err(_err) => {
+                                eprintln!("Invalid auth cookie string");
+                                break
+                            },
 
-                            (String::from_utf8(software_info_bytes[cookie_end_index - 1..end_index + cookie_end_index].to_vec()), end_index)
+                        };
+
+                        let upload_id: [u8; blake3::OUT_LEN] = {
+                            software_info_bytes[cookie_end_index + 1..cookie_end_index + 33].try_into().unwrap() 
                             
                         };
 
+                        if !upload_id_db.contains_key(&upload_id).unwrap() {
+                            eprintln!("Upload ID not found");
+                            break;
 
-                        let upload_id = upload_id.unwrap();
-                        
+                        }
+
                         let mut files = HashMap::new();
 
-                        let mut bytes_iter = software_info_bytes[id_end_index + cookie_end_index + 2..].iter();
+                        let mut bytes_iter = software_info_bytes[cookie_end_index + 33..].iter();
 
                         loop {
                             let mut checksum = [0; blake3::OUT_LEN];
@@ -400,10 +390,11 @@ pub async fn upload_software(websocket: warp::ws::Ws, auth_db: AuthDB, cookie_db
 
 	            		if num_chunks <= MAX_NUM_CHUNKS {
                             software_info = Some(SoftwareInfo { 
-                               auth_cookie,
-                               upload_id,
-                               num_chunks,
-                               files,
+                                username,
+                                auth_cookie,
+                                upload_id,
+                                num_chunks,
+                                files,
 
                             });
 
@@ -429,8 +420,9 @@ pub async fn upload_software(websocket: warp::ws::Ws, auth_db: AuthDB, cookie_db
 }
 
 pub struct SoftwareInfo {
+    username: String,
 	auth_cookie: String,
-	upload_id: String,
+	upload_id: [u8; 32],
     num_chunks: u64,
     files: HashMap<blake3::Hash, String>, 
 }
@@ -469,6 +461,6 @@ pub struct Item {
 	compressed_size: u64,
 	price: ItemPrice,
 	compression_type: CompressionType,
-	compressed_hash: [u8; blake3::OUT_LEN],
-	upload_id: Option<ArrayString<{ 2 * blake3::OUT_LEN }>>,
+    files: HashMap<[u8; 32], String>,
+	upload_id: Option<[u8; 32]>,
 }

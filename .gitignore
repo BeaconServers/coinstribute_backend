@@ -12,3 +12,6 @@ db/
 **/*.rs.bk
 
 /coinstribute.log
+
+.game_files/
+.cached_files/
