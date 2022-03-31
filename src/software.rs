@@ -1,8 +1,9 @@
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::atomic::AtomicU64;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::auth::verify_auth_cookie;
 
@@ -10,21 +11,21 @@ use arrayvec::ArrayString;
 use blake3::Hash;
 use futures::{FutureExt, StreamExt};
 use rand::prelude::*;
-use rayon::iter::IntoParallelIterator;
+//use rayon::prelude::*;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncWriteExt, BufWriter, AsyncReadExt};
+use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use warp::{Rejection, Reply};
 use warp::hyper::{Response, StatusCode};
 use tokio::sync::mpsc;
 use tokio::io::BufReader;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use async_compression::tokio::write::ZstdDecoder;
+//use async_compression::tokio::write::ZstdDecoder;
 
 use crate::{DenialFault, RequestDenial};
 use crate::db::{AuthDB, SoftwareDB, CaptchaDB, DB, CookieDB, UploadIdDB};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum ArchType {
 	/// WASM32 or anything else meant to run in a web browser
 	Web,
@@ -33,7 +34,7 @@ pub enum ArchType {
 
 ///While Zstd is the preferred compression algorithm, the current rust support is bindings to the C library.
 /// This means that for the web version of the site, it can't be used. As an alternative, Brotli is used instead
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum CompressionType {
 	ZSTD,
 	Brotli,
@@ -104,7 +105,7 @@ pub fn new_software(new_software_req: CreateSoftwareReq, auth_db: AuthDB, cookie
 
 	}
 
-	let software_id = current_soft_id.fetch_add(1, Ordering::Relaxed);
+	let software_id = current_soft_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 	let mut random_bytes: [u8; 32] = [0; 32];
 
 	thread_rng().fill_bytes(&mut random_bytes);
@@ -132,6 +133,8 @@ pub fn new_software(new_software_req: CreateSoftwareReq, auth_db: AuthDB, cookie
 	    price: new_software_req.price,
 	    files: HashMap::new(),
 	    upload_id: Some(upload_id_bytes),
+        // Since the software hasn't been uploaded yet, it hasn't been created
+        creation_time: None,
 	};
 
 	software_db.insert(&software_id, &game).unwrap();
@@ -149,7 +152,7 @@ pub fn new_software(new_software_req: CreateSoftwareReq, auth_db: AuthDB, cookie
 }
 
 // TODO: Replace all the sudden disconnects with sending errors back to the client
-pub async fn upload_software(websocket: warp::ws::Ws, auth_db: AuthDB, cookie_db: CookieDB, upload_id_db: UploadIdDB, software_db: SoftwareDB) -> Result<impl Reply, Rejection >{
+pub async fn upload_software(websocket: warp::ws::Ws, cookie_db: CookieDB, upload_id_db: UploadIdDB, software_db: SoftwareDB) -> Result<impl Reply, Rejection >{
 	Ok(websocket.on_upgrade(|ws| async move {
 		let (cli_ws_snd, mut cli_ws_rcv) = ws.split();
 		let (_cli_snd, cli_rcv) = mpsc::unbounded_channel();
@@ -249,6 +252,7 @@ pub async fn upload_software(websocket: warp::ws::Ws, auth_db: AuthDB, cookie_db
                             let mut software_item = software_db.get(&software_id).unwrap().unwrap();
 
                             software_item.files = software_info.files.iter().map(|(k, v)| (*k.as_bytes(), v.clone())).collect();
+                            software_item.creation_time = Some(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
 
                             software_db.insert(&software_id, &software_item).unwrap();
 
@@ -419,6 +423,126 @@ pub async fn upload_software(websocket: warp::ws::Ws, auth_db: AuthDB, cookie_db
 
 }
 
+#[derive(Deserialize)]
+enum SearchAlg {
+    HighestRated,
+    LowestRated,
+    MostDownloaded,
+    LeastDownloaded,
+    Newest,
+    Oldest,
+    Trending,
+    HighestPrice,
+    LowestPrice,
+
+}
+
+
+#[derive(Deserialize)]
+pub struct SearchSoftwareReq {
+    term: String,
+    sort_by: SearchAlg,
+    start_index: u64,
+    num_results: u16,
+}
+
+#[derive(Serialize)]
+struct SearchResult {
+    title: String,
+    item_id: u64,
+    creation_time: u64,
+
+}
+
+impl From<Item> for SearchResult {
+    fn from(item: Item) -> Self {
+        SearchResult {
+            title: item.title,
+            item_id: item.id,
+            creation_time: item.creation_time.unwrap(),
+
+        }
+       
+    }
+
+}
+
+pub async fn search_software(search_req: SearchSoftwareReq, software_db: SoftwareDB) -> Result<impl Reply, Rejection> {
+    const MAX_NUM_RESULTS: u16 = 100;
+
+    if search_req.num_results > MAX_NUM_RESULTS {
+        let denial = RequestDenial::new(DenialFault::User, String::from("Too many results requested"), format!("Try requesting {MAX_NUM_RESULTS} results or less"));
+        return Ok(denial.into_response(StatusCode::BAD_REQUEST));
+
+    }
+
+    let capacity = software_db.len().min(search_req.num_results.into());
+
+    let mut results = Vec::with_capacity(capacity);
+
+    software_db.iter().for_each(|res| {
+        let (_item_id, item) = res.unwrap();
+       
+        if item.creation_time.is_some() && item.title.to_lowercase().contains(&search_req.term) {
+            if results.len() < capacity {
+                results.push(item);
+
+            } else {
+                let search_alg = match search_req.sort_by {
+                    SearchAlg::Newest => newest_item,
+                    SearchAlg::Oldest => oldest_item,
+                    _ => todo!(),
+                };
+
+                let worst_item = results.iter_mut().reduce(|item1, item2| {
+                    match search_alg(item1, item2) {
+                        // We find the worst item by just doing the search algorithm, and seeing
+                        // returning the item that is worse (greater)
+                        Ordering::Greater => item1,
+                        Ordering::Less => item2,
+                        Ordering::Equal => item1,
+                    }
+                });
+
+                // If there's only 1 item in the Vec, then just get the first one since it's the
+                // "worst" 
+                let worst_item = match worst_item {
+                    Some(item) => item,
+                    None => results.get_mut(0).unwrap(),
+                };
+
+                
+                if search_alg(&item, worst_item) == Ordering::Less {
+                    *worst_item = item;
+
+                }
+            }
+        }
+
+    });
+
+    let results: Vec<SearchResult> = results.into_iter().map(|item| {
+        let result: SearchResult = item.into();
+        result
+
+    }).collect();
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .body(simd_json::to_string(&results).unwrap())
+        .unwrap())
+
+}
+
+fn newest_item(item1: &Item, item2: &Item) -> Ordering {
+    item2.id.cmp(&item1.id)
+}
+
+fn oldest_item(item1: &Item, item2: &Item) -> Ordering {
+    item1.id.cmp(&item2.id)
+
+}
+
 pub struct SoftwareInfo {
     username: String,
 	auth_cookie: String,
@@ -432,7 +556,7 @@ pub struct ChunkInfo {
 	file: blake3::Hash,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum ItemPrice {
 	// For the pay what you want modle, the min and max must be the same CurrencyType
 	PayWhatYouWant {
@@ -443,7 +567,7 @@ pub enum ItemPrice {
 	None,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum CurrencyAmount {
 	// The price is listed in Monero
 	Monero(u64),
@@ -451,7 +575,7 @@ pub enum CurrencyAmount {
 	Fiat(Decimal),
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Item {
 	id: u64,
 	title: String,
@@ -463,4 +587,6 @@ pub struct Item {
 	compression_type: CompressionType,
     files: HashMap<[u8; 32], String>,
 	upload_id: Option<[u8; 32]>,
+    creation_time: Option<u64>,
 }
+

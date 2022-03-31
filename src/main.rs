@@ -197,11 +197,16 @@ fn main() {
 
     let upload_software = warp::path("upload_software")
         .and(warp::ws())
-        .and(auth_db.clone())
         .and(cookie_db_filter.clone())
         .and(upload_id_db_filter.clone())
         .and(software_db_filter.clone())
         .and_then(upload_software);
+
+    let search_software = warp::path("search_software")
+        .and(warp::body::content_length_limit(2048))
+        .and(warp::body::json())
+        .and(software_db_filter.clone())
+        .and_then(search_software);
 
     let create_captcha = warp::path("create_captcha")
         .and(captcha_db_filter.clone())
@@ -221,6 +226,7 @@ fn main() {
             .or(withdraw_monero)
             .or(server_profits)
             .or(new_software)
+            .or(search_software)
         );
 
     let get_routes = warp::get()
