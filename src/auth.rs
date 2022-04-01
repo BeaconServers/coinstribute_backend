@@ -504,13 +504,6 @@ async fn auth_cookie_result_to_response(
 }
 
 pub(crate) fn destroy_expired_auth_cookies(auth_cookie_db: CookieDB) {
-    // This only exists in debug builds
-    #[cfg(debug_assertions)]
-    if std::env::var("NO_DESTROY_CAPTCHAS") == Ok("true".to_string()) {
-        return;
-
-    }
-
 	loop {
 		use std::thread::sleep;
 
@@ -667,6 +660,12 @@ struct CaptchaGuess {
 
 pub fn destroy_expired_captchas(captcha_db: CaptchaDB) {
 	loop {
+		#[cfg(debug_assertions)]
+		if std::env::var("NO_DESTROY_CAPTCHAS").is_ok() {
+			println!("Not destroying captchas");
+			return;
+		}
+
 		let time = SystemTime::now()
 			.duration_since(UNIX_EPOCH)
 			.unwrap()

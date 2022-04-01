@@ -20,7 +20,6 @@ use warp::{Rejection, Reply};
 
 use crate::auth::verify_auth_cookie;
 use crate::db::{AuthDB, CaptchaDB, CookieDB, SoftwareDB, UploadIdDB, DB};
-use async_compression::tokio::write::ZstdDecoder;
 use crate::{DenialFault, RequestDenial};
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -191,9 +190,10 @@ pub async fn upload_software(
 
 		const CHUNK_BUFFER_LEN: usize = 65535;
 		let mut chunk_buffer = [0_u8; CHUNK_BUFFER_LEN];
+		let mut checked_zstd = false;
 
-		while let Some(result) = cli_ws_rcv.next().await {
-			let _msg = match result {
+		'connection: while let Some(result) = cli_ws_rcv.next().await {
+			match result {
 				Ok(msg) => {
 					let msg = msg.as_bytes();
 
@@ -204,25 +204,11 @@ pub async fn upload_software(
 								src_path.push(".cached_files/");
 								src_path.push(&hash.to_string());
 
-								let mut source = None;
-
-								while source.is_none() {
-									tokio::time::sleep(Duration::from_secs(1)).await;
-
-									source = match tokio::fs::OpenOptions::new()
-										.read(true)
-										.open(&src_path)
-										.await
-									{
-										Ok(source) => Some(source),
-										Err(err) => {
-											println!("Error on file read: {err:?}");
-											None
-										},
-									};
-								}
-
-								let source = source.unwrap();
+								let source = tokio::fs::OpenOptions::new()
+									.read(true)
+									.open(&src_path)
+									.await
+									.unwrap();
 
 								let mut dst_path = PathBuf::new();
 								dst_path.push(".game_files/");
@@ -263,25 +249,7 @@ pub async fn upload_software(
 									panic!("Hash: {}\nComputed Hash: {}", hash, computed_hash);
 								}
 
-                                let dst = tokio::fs::OpenOptions::new()
-                                    .write(true)
-                                    .create(true)
-                                    .open("/dev/null")
-                                    .await
-                                    .unwrap();
-
-                                // Just decompresses the file to /dev/null
-                                let zstd_file = tokio::fs::OpenOptions::new().read(true).open(&src_path).await.unwrap();
-                                let mut file_src = BufReader::new(zstd_file);
-
-                                let mut zstd = ZstdDecoder::new(dst);
-
-                                if let Err(err) = tokio::io::copy(&mut file_src, &mut zstd).await {
-                                    panic!("Bad ZSTD file due to error: {err:?}");
-                                    break;
-
-                                }
-
+								// Just decompresses the file to /dev/null
 								tokio::fs::copy(&src_path, &dst_path).await.unwrap();
 								remove_cached_files().await;
 
@@ -308,7 +276,7 @@ pub async fn upload_software(
 							software_db.insert(&software_id, &software_item).unwrap();
 
 							println!("Added software");
-							break;
+							break 'connection;
 						}
 
 						if let Some(chunk_info_ref) = chunk_info.as_ref() {
@@ -324,24 +292,29 @@ pub async fn upload_software(
 								// When we've finished writing a single chunk to memory, begin
 								// writing it to disk
 								let file_hash = chunk_info_ref.file;
-								tokio::task::spawn(async move {
-									let chunk_buffer = &chunk_buffer[..amt_written_to_buffer];
-									let mut path = PathBuf::new();
-									path.push(".cached_files/");
 
-									tokio::fs::create_dir_all(path.clone()).await.unwrap();
-									path.push(&file_hash.to_string());
-									let mut file = tokio::fs::OpenOptions::new()
-										.append(true)
-										.create(true)
-										.open(path)
-										.await
-										.unwrap();
+								let chunk_buffer = &chunk_buffer[..amt_written_to_buffer];
+								let mut path = PathBuf::new();
+								path.push(".cached_files/");
 
-									file.write_all(chunk_buffer).await.unwrap();
-									file.flush().await.unwrap();
-									file.shutdown().await.unwrap();
-								});
+								tokio::fs::create_dir_all(path.clone()).await.unwrap();
+								path.push(&file_hash.to_string());
+								let mut file = tokio::fs::OpenOptions::new()
+									.append(true)
+									.create(true)
+									.open(&path)
+									.await
+									.unwrap();
+
+								file.write_all(chunk_buffer).await.unwrap();
+								file.flush().await.unwrap();
+								file.shutdown().await.unwrap();
+
+								if !checked_zstd && !infer::is(chunk_buffer, "zst") {
+									checked_zstd = true;
+									tokio::fs::remove_file(path).await.unwrap();
+									panic!("The file given is NOT a zst file");
+								}
 
 								// Reset the chunk buffer stuff
 								amt_written_to_buffer = 0;
