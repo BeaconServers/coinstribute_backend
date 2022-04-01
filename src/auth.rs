@@ -504,6 +504,13 @@ async fn auth_cookie_result_to_response(
 }
 
 pub(crate) fn destroy_expired_auth_cookies(auth_cookie_db: CookieDB) {
+    // This only exists in debug builds
+    #[cfg(debug_assertions)]
+    if std::env::var("NO_DESTROY_CAPTCHAS") == Ok("true".to_string()) {
+        return;
+
+    }
+
 	loop {
 		use std::thread::sleep;
 

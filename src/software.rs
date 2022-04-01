@@ -20,7 +20,7 @@ use warp::{Rejection, Reply};
 
 use crate::auth::verify_auth_cookie;
 use crate::db::{AuthDB, CaptchaDB, CookieDB, SoftwareDB, UploadIdDB, DB};
-// use async_compression::tokio::write::ZstdDecoder;
+use async_compression::tokio::write::ZstdDecoder;
 use crate::{DenialFault, RequestDenial};
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -262,6 +262,25 @@ pub async fn upload_software(
 									remove_cached_files().await;
 									panic!("Hash: {}\nComputed Hash: {}", hash, computed_hash);
 								}
+
+                                let dst = tokio::fs::OpenOptions::new()
+                                    .write(true)
+                                    .create(true)
+                                    .open("/dev/null")
+                                    .await
+                                    .unwrap();
+
+                                // Just decompresses the file to /dev/null
+                                let zstd_file = tokio::fs::OpenOptions::new().read(true).open(&src_path).await.unwrap();
+                                let mut file_src = BufReader::new(zstd_file);
+
+                                let mut zstd = ZstdDecoder::new(dst);
+
+                                if let Err(err) = tokio::io::copy(&mut file_src, &mut zstd).await {
+                                    panic!("Bad ZSTD file due to error: {err:?}");
+                                    break;
+
+                                }
 
 								tokio::fs::copy(&src_path, &dst_path).await.unwrap();
 								remove_cached_files().await;
