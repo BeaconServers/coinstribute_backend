@@ -1,4 +1,4 @@
-//TODO: Use the log
+// TODO: Use the log
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -6,11 +6,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use monero::Address;
 use serde::Serialize;
-use tokio::sync::mpsc::error::SendError;
-use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::fs;
-use tokio::sync::Mutex;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc::error::SendError;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::Mutex;
 
 #[derive(Debug, Serialize)]
 pub struct Log {
@@ -25,24 +25,27 @@ pub struct Log {
 }
 
 impl Log {
-	pub fn new(username: Option<String>, ip: IpAddr, event: Event, log_type: LogType, reason: String, priority: Priority) -> Self {
+	pub fn new(
+		username: Option<String>, ip: IpAddr, event: Event, log_type: LogType, reason: String,
+		priority: Priority,
+	) -> Self {
 		Self {
 			username,
-			time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+			time: SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.unwrap()
+				.as_secs(),
 			log_type,
 			ip,
 			event,
 			reason,
 			priority,
 		}
-
 	}
 
 	pub async fn send(self, log_sender: &Sender<Self>) -> Result<(), SendError<Self>> {
 		log_sender.send(self).await
-
 	}
-
 }
 
 pub async fn logging_service(mut log_ev: Receiver<Log>) {
@@ -89,28 +92,17 @@ pub async fn logging_service(mut log_ev: Receiver<Log>) {
 			// Drop the lock on the logs
 			std::mem::drop(logs_to_write);
 			force_write_sender.send(()).await.unwrap();
-
 		}
 	}
 }
 
 #[derive(Debug, Serialize)]
 pub enum Event {
-	Registration {
-		success: bool,
-	},
-	Login {
-		success: bool,
-	},
-	Withdrawal {
-		amt: u64,
-		addr: Address,
-	},
+	Registration { success: bool },
+	Login { success: bool },
+	Withdrawal { amt: u64, addr: Address },
 	GetBalance,
-	BalanceChange {
-		from: u64,
-		to: u64,
-	},
+	BalanceChange { from: u64, to: u64 },
 	ServerError,
 	UserError,
 	DepositReq,
@@ -121,7 +113,7 @@ pub enum Event {
 #[derive(Debug, Serialize)]
 pub enum LogType {
 	Auth,
-	Money,	
+	Money,
 }
 
 #[derive(Debug, Serialize)]

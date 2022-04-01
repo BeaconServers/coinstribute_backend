@@ -1,29 +1,27 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-use crate::auth::verify_auth_cookie;
 
 use arrayvec::ArrayString;
 use blake3::Hash;
 use futures::{FutureExt, StreamExt};
 use rand::prelude::*;
-//use rayon::prelude::*;
+// use rayon::prelude::*;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncWriteExt, AsyncReadExt};
-use warp::{Rejection, Reply};
-use warp::hyper::{Response, StatusCode};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
-use tokio::io::BufReader;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-//use async_compression::tokio::write::ZstdDecoder;
+use warp::hyper::{Response, StatusCode};
+use warp::{Rejection, Reply};
 
+use crate::auth::verify_auth_cookie;
+use crate::db::{AuthDB, CaptchaDB, CookieDB, SoftwareDB, UploadIdDB, DB};
+// use async_compression::tokio::write::ZstdDecoder;
 use crate::{DenialFault, RequestDenial};
-use crate::db::{AuthDB, SoftwareDB, CaptchaDB, DB, CookieDB, UploadIdDB};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub enum ArchType {
@@ -32,7 +30,7 @@ pub enum ArchType {
 	X86_64,
 }
 
-///While Zstd is the preferred compression algorithm, the current rust support is bindings to the C library.
+/// While Zstd is the preferred compression algorithm, the current rust support is bindings to the C library.
 /// This means that for the web version of the site, it can't be used. As an alternative, Brotli is used instead
 #[derive(Clone, Serialize, Deserialize)]
 pub enum CompressionType {
@@ -52,57 +50,74 @@ pub struct CreateSoftwareReq {
 	compression_type: CompressionType,
 	captcha_hash: ArrayString<{ 2 * blake3::OUT_LEN }>,
 	captcha_answer: String,
-
 }
-
 
 #[derive(Serialize)]
 pub struct NewSoftwareResp {
 	upload_id: ArrayString<{ 2 * blake3::OUT_LEN }>,
 }
 
-pub fn new_software(new_software_req: CreateSoftwareReq, auth_db: AuthDB, cookie_db: CookieDB, software_db: SoftwareDB, upload_id_db: UploadIdDB, captcha_db: CaptchaDB, current_soft_id: Arc<AtomicU64>) -> Response<String> {
+pub fn new_software(
+	new_software_req: CreateSoftwareReq, auth_db: AuthDB, cookie_db: CookieDB,
+	software_db: SoftwareDB, upload_id_db: UploadIdDB, captcha_db: CaptchaDB,
+	current_soft_id: Arc<AtomicU64>,
+) -> Response<String> {
 	let bad_captcha = || -> Response<String> {
 		let denial = RequestDenial::new(
-			DenialFault::User, 
-			"Incorrect captcha".to_string(), 
-			String::new()
+			DenialFault::User,
+			"Incorrect captcha".to_string(),
+			String::new(),
 		);
 
 		denial.into_response(StatusCode::UNAUTHORIZED)
 	};
 
-	let captcha_hash = match hex_simd::decode_to_boxed_bytes(new_software_req.captcha_hash.as_bytes()) {
-		Ok(captcha_hash) => captcha_hash,
-		Err(_err) => {
-			return bad_captcha();
-		}
+	let captcha_hash =
+		match hex_simd::decode_to_boxed_bytes(new_software_req.captcha_hash.as_bytes()) {
+			Ok(captcha_hash) => captcha_hash,
+			Err(_err) => {
+				return bad_captcha();
+			},
+		};
 
-	};
-
-	let captcha = match captcha_db.get(captcha_hash.as_ref().try_into().unwrap()).unwrap() {
+	let captcha = match captcha_db
+		.get(captcha_hash.as_ref().try_into().unwrap())
+		.unwrap()
+	{
 		Some(captcha) => captcha,
 		None => {
 			return bad_captcha();
-		}
+		},
 	};
 
 	if captcha.answer != new_software_req.captcha_answer {
 		return bad_captcha();
-
 	}
 
-	if !auth_db.contains_key(&new_software_req.username).unwrap() || !verify_auth_cookie(&new_software_req.username, &new_software_req.auth_cookie, &cookie_db) {
-		let denial = RequestDenial::new(DenialFault::User, String::from("Invalid username or cookie"), String::new());
+	if !auth_db.contains_key(&new_software_req.username).unwrap() ||
+		!verify_auth_cookie(
+			&new_software_req.username,
+			&new_software_req.auth_cookie,
+			&cookie_db,
+		) {
+		let denial = RequestDenial::new(
+			DenialFault::User,
+			String::from("Invalid username or cookie"),
+			String::new(),
+		);
 		return denial.into_response(StatusCode::UNAUTHORIZED);
-
 	}
 
 	// While obviously modified clients can just lie about how large the game's size is, there are strict checks when actually uplaoading the game to ensure that the file is the exact size specified
-	if new_software_req.compressed_size > 10_000_000 /*10 MB*/ {
-		let denial = RequestDenial::new(DenialFault::User, String::from("File is too large"), "Please keep your compressed game files under 10 MB".to_string());
+	if new_software_req.compressed_size > 10_000_000
+	// 10 MB
+	{
+		let denial = RequestDenial::new(
+			DenialFault::User,
+			String::from("File is too large"),
+			"Please keep your compressed game files under 10 MB".to_string(),
+		);
 		return denial.into_response(StatusCode::BAD_REQUEST);
-
 	}
 
 	let software_id = current_soft_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -110,7 +125,9 @@ pub fn new_software(new_software_req: CreateSoftwareReq, auth_db: AuthDB, cookie
 
 	thread_rng().fill_bytes(&mut random_bytes);
 
-	let mut bytes_to_hash = Vec::with_capacity(random_bytes.len() + new_software_req.title.len() + new_software_req.username.len());
+	let mut bytes_to_hash = Vec::with_capacity(
+		random_bytes.len() + new_software_req.title.len() + new_software_req.username.len(),
+	);
 
 	bytes_to_hash.extend_from_slice(&random_bytes);
 	bytes_to_hash.extend_from_slice(new_software_req.title.as_bytes());
@@ -118,23 +135,23 @@ pub fn new_software(new_software_req: CreateSoftwareReq, auth_db: AuthDB, cookie
 
 	// Basically just a way of generating a pretty random ID
 	let upload_id_hash = blake3::hash(&bytes_to_hash);
-    let upload_id_bytes = *upload_id_hash.as_bytes();
+	let upload_id_bytes = *upload_id_hash.as_bytes();
 
-    let upload_id_str = upload_id_hash.to_hex();
+	let upload_id_str = upload_id_hash.to_hex();
 
 	let game = Item {
-	    id: software_id,
-	    title: new_software_req.title,
-	    creator: new_software_req.username,
-	    description: new_software_req.description,
-	    arch_type: new_software_req.arch_type,
-	    compression_type: new_software_req.compression_type,
-	    compressed_size: new_software_req.compressed_size,
-	    price: new_software_req.price,
-	    files: HashMap::new(),
-	    upload_id: Some(upload_id_bytes),
-        // Since the software hasn't been uploaded yet, it hasn't been created
-        creation_time: None,
+		id: software_id,
+		title: new_software_req.title,
+		creator: new_software_req.username,
+		description: new_software_req.description,
+		arch_type: new_software_req.arch_type,
+		compression_type: new_software_req.compression_type,
+		compressed_size: new_software_req.compressed_size,
+		price: new_software_req.price,
+		files: HashMap::new(),
+		upload_id: Some(upload_id_bytes),
+		// Since the software hasn't been uploaded yet, it hasn't been created
+		creation_time: None,
 	};
 
 	software_db.insert(&software_id, &game).unwrap();
@@ -148,11 +165,12 @@ pub fn new_software(new_software_req: CreateSoftwareReq, auth_db: AuthDB, cookie
 		.status(StatusCode::OK)
 		.body(simd_json::to_string(&resp).unwrap())
 		.unwrap()
-	
 }
 
 // TODO: Replace all the sudden disconnects with sending errors back to the client
-pub async fn upload_software(websocket: warp::ws::Ws, cookie_db: CookieDB, upload_id_db: UploadIdDB, software_db: SoftwareDB) -> Result<impl Reply, Rejection >{
+pub async fn upload_software(
+	websocket: warp::ws::Ws, cookie_db: CookieDB, upload_id_db: UploadIdDB, software_db: SoftwareDB,
+) -> Result<impl Reply, Rejection> {
 	Ok(websocket.on_upgrade(|ws| async move {
 		let (cli_ws_snd, mut cli_ws_rcv) = ws.split();
 		let (_cli_snd, cli_rcv) = mpsc::unbounded_channel();
@@ -160,395 +178,411 @@ pub async fn upload_software(websocket: warp::ws::Ws, cookie_db: CookieDB, uploa
 		let cli_rcv = UnboundedReceiverStream::new(cli_rcv);
 
 		tokio::task::spawn(cli_rcv.forward(cli_ws_snd).map(|result| {
-	        if let Err(e) = result {
-	            println!("error sending websocket msg: {}", e);
-	        }
-	    }));
+			if let Err(e) = result {
+				println!("error sending websocket msg: {}", e);
+			}
+		}));
 
-	    let mut software_info: Option<SoftwareInfo> = None;
+		let mut software_info: Option<SoftwareInfo> = None;
 
-        let mut num_chunks = 0;
-        let mut amt_written_to_buffer = 0;
+		let mut num_chunks = 0;
+		let mut amt_written_to_buffer = 0;
 		let mut chunk_info: Option<ChunkInfo> = None;
 
-        const CHUNK_BUFFER_LEN: usize = 65535;
-	    let mut chunk_buffer = [0_u8; CHUNK_BUFFER_LEN]; 
+		const CHUNK_BUFFER_LEN: usize = 65535;
+		let mut chunk_buffer = [0_u8; CHUNK_BUFFER_LEN];
 
-	    while let Some(result) = cli_ws_rcv.next().await {
-	        let _msg = match result {
-	            Ok(msg) => {
-                    let msg = msg.as_bytes();
+		while let Some(result) = cli_ws_rcv.next().await {
+			let _msg = match result {
+				Ok(msg) => {
+					let msg = msg.as_bytes();
 
-	            	if let Some(software_info) = software_info.as_ref() {
-                        if num_chunks == software_info.num_chunks {
-                            for (hash, _file) in software_info.files.iter() {
-                                let mut src_path = PathBuf::new();
-                                src_path.push(".cached_files/");
-                                src_path.push(&hash.to_string());
+					if let Some(software_info) = software_info.as_ref() {
+						if num_chunks == software_info.num_chunks {
+							for (hash, _file) in software_info.files.iter() {
+								let mut src_path = PathBuf::new();
+								src_path.push(".cached_files/");
+								src_path.push(&hash.to_string());
 
-                                let mut source = None;
+								let mut source = None;
 
-                                while source.is_none() {
-                                    tokio::time::sleep(Duration::from_secs(1)).await;
+								while source.is_none() {
+									tokio::time::sleep(Duration::from_secs(1)).await;
 
-                                    source = match tokio::fs::OpenOptions::new().read(true).open(&src_path).await {
-                                            Ok(source) => Some(source),
-                                            Err(err) => {
-                                                println!("Error on file read: {err:?}");
-                                                None
+									source = match tokio::fs::OpenOptions::new()
+										.read(true)
+										.open(&src_path)
+										.await
+									{
+										Ok(source) => Some(source),
+										Err(err) => {
+											println!("Error on file read: {err:?}");
+											None
+										},
+									};
+								}
 
-                                            },
+								let source = source.unwrap();
 
-                                    };
+								let mut dst_path = PathBuf::new();
+								dst_path.push(".game_files/");
+								tokio::fs::create_dir_all(&dst_path).await.unwrap();
 
-                                }
+								dst_path.push(&hash.to_string());
 
-                                let source = source.unwrap();
+								// Before decompressing, check the hash of the file
 
-                                let mut dst_path = PathBuf::new();
-                                dst_path.push(".game_files/");
-                                tokio::fs::create_dir_all(&dst_path).await.unwrap();
+								let mut hasher = blake3::Hasher::new();
+								let mut file_src = BufReader::new(source);
+								let buffer = &mut chunk_buffer;
 
-                                dst_path.push(&hash.to_string());
+								loop {
+									match file_src.read(buffer).await {
+										Ok(0) => break,
+										Ok(n) => hasher.update(&buffer[..n]),
+										Err(ref e) => {
+											if e.kind() == tokio::io::ErrorKind::Interrupted {
+												continue;
+											} else {
+												panic!("{e}");
+											}
+										},
+									};
+								}
 
-                                // Before decompressing, check the hash of the file
+								let computed_hash = hasher.finalize();
 
-                                let mut hasher = blake3::Hasher::new();
-                                let mut file_src = BufReader::new(source);
-                                let buffer = &mut chunk_buffer;
-                                
-                                loop {
-                                    match file_src.read(buffer).await {
-                                        Ok(0) => break,
-                                        Ok(n) => hasher.update(&buffer[..n]),
-                                        Err(ref e) if e.kind() == tokio::io::ErrorKind::Interrupted => continue,
-                                        Err(e) => panic!("{}", e),
-                                    };
-                                }
-                                
-                                let computed_hash = hasher.finalize();
+								// corrupted file
+								let remove_cached_files =
+									|| async { tokio::fs::remove_file(&src_path).await.unwrap() };
 
-                                // corrupted file
-                                let remove_cached_files = || async { tokio::fs::remove_file(&src_path).await.unwrap() };
+								if *hash == computed_hash {
+									println!("Hashes are equivalent");
+								} else {
+									remove_cached_files().await;
+									panic!("Hash: {}\nComputed Hash: {}", hash, computed_hash);
+								}
 
-                                if *hash == computed_hash {
-                                    println!("Hashes are equivalent");
+								tokio::fs::copy(&src_path, &dst_path).await.unwrap();
+								remove_cached_files().await;
 
-                                } else {
-                                    remove_cached_files().await;
-                                    panic!("Hash: {}\nComputed Hash: {}", hash, computed_hash);
+								println!("Finished writing");
+							}
 
-                                }
+							// When all of the files are properly checksummed, finish up.
+							let software_id =
+								upload_id_db.get(&software_info.upload_id).unwrap().unwrap();
+							let mut software_item = software_db.get(&software_id).unwrap().unwrap();
 
-                                tokio::fs::copy(&src_path, &dst_path).await.unwrap();
-                                remove_cached_files().await;
+							software_item.files = software_info
+								.files
+								.iter()
+								.map(|(k, v)| (*k.as_bytes(), v.clone()))
+								.collect();
+							software_item.creation_time = Some(
+								SystemTime::now()
+									.duration_since(UNIX_EPOCH)
+									.unwrap()
+									.as_secs(),
+							);
 
-                                println!("Finished writing");
+							software_db.insert(&software_id, &software_item).unwrap();
 
-                            }
-
-                            // When all of the files are properly checksummed, finish up.
-                            let software_id = upload_id_db.get(&software_info.upload_id).unwrap().unwrap();
-                            let mut software_item = software_db.get(&software_id).unwrap().unwrap();
-
-                            software_item.files = software_info.files.iter().map(|(k, v)| (*k.as_bytes(), v.clone())).collect();
-                            software_item.creation_time = Some(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
-
-                            software_db.insert(&software_id, &software_item).unwrap();
-
-                            println!("Added software");
-                            break;
-
-                        }
+							println!("Added software");
+							break;
+						}
 
 						if let Some(chunk_info_ref) = chunk_info.as_ref() {
-                            chunk_buffer[..(amt_written_to_buffer + msg.len())].as_mut().copy_from_slice(msg);
-                            amt_written_to_buffer += msg.len();
+							chunk_buffer[..(amt_written_to_buffer + msg.len())]
+								.as_mut()
+								.copy_from_slice(msg);
+							amt_written_to_buffer += msg.len();
 
-                            let amt_written_to_buffer_as_u64: u64 = amt_written_to_buffer.try_into().unwrap();
+							let amt_written_to_buffer_as_u64: u64 =
+								amt_written_to_buffer.try_into().unwrap();
 
-                            if amt_written_to_buffer_as_u64 == chunk_info_ref.len {
-                                // When we've finished writing a single chunk to memory, begin
-                                // writing it to disk
-                                let file_hash = chunk_info_ref.file;
-                                tokio::task::spawn(async move {
-                                    let chunk_buffer = &chunk_buffer[..amt_written_to_buffer];
-                                    let mut path = PathBuf::new();
-                                    path.push(".cached_files/");
+							if amt_written_to_buffer_as_u64 == chunk_info_ref.len {
+								// When we've finished writing a single chunk to memory, begin
+								// writing it to disk
+								let file_hash = chunk_info_ref.file;
+								tokio::task::spawn(async move {
+									let chunk_buffer = &chunk_buffer[..amt_written_to_buffer];
+									let mut path = PathBuf::new();
+									path.push(".cached_files/");
 
-                                    tokio::fs::create_dir_all(path.clone()).await.unwrap();
-                                    path.push(&file_hash.to_string());
-                                    let mut file = tokio::fs::OpenOptions::new()
-                                        .append(true)
-                                        .create(true)
-                                        .open(path)
-                                        .await
-                                        .unwrap();
-                                   
-                                    file.write_all(chunk_buffer).await.unwrap();
-                                    file.flush().await.unwrap();
-                                    file.shutdown().await.unwrap();
-                                });
+									tokio::fs::create_dir_all(path.clone()).await.unwrap();
+									path.push(&file_hash.to_string());
+									let mut file = tokio::fs::OpenOptions::new()
+										.append(true)
+										.create(true)
+										.open(path)
+										.await
+										.unwrap();
 
+									file.write_all(chunk_buffer).await.unwrap();
+									file.flush().await.unwrap();
+									file.shutdown().await.unwrap();
+								});
 
-                                // Reset the chunk buffer stuff
-                                amt_written_to_buffer = 0;
-                                chunk_info = None;
+								// Reset the chunk buffer stuff
+								amt_written_to_buffer = 0;
+								chunk_info = None;
 
-                                num_chunks += 1;
+								num_chunks += 1;
+							}
+						} else {
+							let chunk_info_bytes = &msg;
+							chunk_info = Some(ChunkInfo {
+								len: u64::from_le_bytes(chunk_info_bytes[0..8].try_into().unwrap()),
+								file: {
+									let checksum_array: [u8; 32] =
+										chunk_info_bytes[8..40].try_into().unwrap();
+									Hash::from(checksum_array)
+								},
+							});
+						}
+					} else {
+						let software_info_bytes = &msg;
 
-                            }
+						let num_chunks =
+							u64::from_le_bytes(software_info_bytes[0..8].try_into().unwrap());
+						let (username, username_end_index) = {
+							let username_end_index: usize = software_info_bytes[8..]
+								.iter()
+								.position(|b| *b == 0)
+								.unwrap() + 8;
+							(
+								String::from_utf8(
+									software_info_bytes[8..username_end_index].to_vec(),
+								),
+								username_end_index,
+							)
+						};
+						let username = match username {
+							Ok(username) => username,
+							Err(_err) => {
+								eprintln!("Invalid username");
+								break;
+							},
+						};
 
-		            	} else {
-		            		let chunk_info_bytes = &msg;
-		            		chunk_info = Some(ChunkInfo {
-		            			len: u64::from_le_bytes(chunk_info_bytes[0..8].try_into().unwrap()),
-		            			file: {
-		            				let checksum_array: [u8; 32] = chunk_info_bytes[8..40].try_into().unwrap();
-		            				Hash::from(checksum_array)
-		            			},
-		            		});
+						let (auth_cookie, cookie_end_index) = {
+							let auth_cookie_end_index: usize = software_info_bytes
+								[username_end_index + 1..]
+								.iter()
+								.position(|b| *b == 0)
+								.unwrap() + username_end_index + 1;
+							(
+								String::from_utf8(
+									software_info_bytes
+										[username_end_index + 1..auth_cookie_end_index]
+										.to_vec(),
+								),
+								auth_cookie_end_index,
+							)
+						};
 
-		            	}
-	            	} else {
-	            		let software_info_bytes = &msg;
+						let auth_cookie = match auth_cookie {
+							Ok(cookie) => {
+								match verify_auth_cookie(&username, &cookie, &cookie_db) {
+									true => cookie,
+									false => {
+										eprintln!("Invalid auth cookie");
+										break;
+									},
+								}
+							},
+							Err(_err) => {
+								eprintln!("Invalid auth cookie string");
+								break;
+							},
+						};
 
-	            		let num_chunks = u64::from_le_bytes(software_info_bytes[0..8].try_into().unwrap());
-                        let (username, username_end_index) = {
-                            let username_end_index: usize = software_info_bytes[8..].iter().position(|b| *b == 0).unwrap() + 8;
-                            (String::from_utf8(software_info_bytes[8..username_end_index].to_vec()), username_end_index)
+						let upload_id: [u8; blake3::OUT_LEN] = {
+							software_info_bytes[cookie_end_index + 1..cookie_end_index + 33]
+								.try_into()
+								.unwrap()
+						};
 
-                        };
-                        let username = match username {
-                            Ok(username) => username,
-                            Err(_err) => {
-                                eprintln!("Invalid username");
-                                break
-                            },
+						if !upload_id_db.contains_key(&upload_id).unwrap() {
+							eprintln!("Upload ID not found");
+							break;
+						}
 
-                        };
+						let mut files = HashMap::new();
 
-                        
-	            		let (auth_cookie, cookie_end_index) = {
-	            			let auth_cookie_end_index: usize = software_info_bytes[username_end_index + 1..].iter().position(|b| *b == 0).unwrap() + username_end_index + 1;
-                            (String::from_utf8(software_info_bytes[username_end_index + 1..auth_cookie_end_index].to_vec()), auth_cookie_end_index)
-	            		};
+						let mut bytes_iter = software_info_bytes[cookie_end_index + 33..].iter();
 
-                        let auth_cookie = match auth_cookie {
-                            Ok(cookie) => {
-                                match verify_auth_cookie(&username, &cookie, &cookie_db) {
-                                    true => cookie,
-                                    false => {
-                                        eprintln!("Invalid auth cookie");
-                                        break;
-                                    },
-                                }
-                            },
-                            Err(_err) => {
-                                eprintln!("Invalid auth cookie string");
-                                break
-                            },
+						loop {
+							let mut checksum = [0; blake3::OUT_LEN];
 
-                        };
+							if bytes_iter.size_hint().0 == 0 {
+								break;
+							}
 
-                        let upload_id: [u8; blake3::OUT_LEN] = {
-                            software_info_bytes[cookie_end_index + 1..cookie_end_index + 33].try_into().unwrap() 
-                            
-                        };
+							let checksum_iter = bytes_iter.by_ref().take(blake3::OUT_LEN);
 
-                        if !upload_id_db.contains_key(&upload_id).unwrap() {
-                            eprintln!("Upload ID not found");
-                            break;
+							checksum_iter.into_iter().zip(checksum.iter_mut()).for_each(
+								|(byte, chk_b)| {
+									*chk_b = *byte;
+								},
+							);
 
-                        }
+							let filename_iter =
+								bytes_iter.by_ref().take_while(|b| **b != 0).copied();
 
-                        let mut files = HashMap::new();
+							let filename_vec = filename_iter.collect::<Vec<u8>>();
+							let filename = String::from_utf8_lossy(&filename_vec);
 
-                        let mut bytes_iter = software_info_bytes[cookie_end_index + 33..].iter();
+							files.insert(Hash::from(checksum), filename.to_string());
+						}
 
-                        loop {
-                            let mut checksum = [0; blake3::OUT_LEN];
+						// Since each chunk can be up to a maximum of 8192 bytes, and the maximum size per game is 10_485_760 bytes, meaning max num of chunks is 1280
+						const MAX_NUM_CHUNKS: u64 = 10_485_760 / 8192; // 1280 chunks
 
-                            if bytes_iter.size_hint().0 == 0 {
-                                break;
-
-                            }
-
-                            let checksum_iter = bytes_iter.by_ref().take(blake3::OUT_LEN);
-
-                            checksum_iter.into_iter().zip(checksum.iter_mut()).for_each(|(byte, chk_b)| {
-                                *chk_b = *byte;
-                                
-                            }); 
-
-                            let filename_iter = bytes_iter.by_ref().take_while(|b| **b != 0).copied();
-
-                            let filename_vec = filename_iter.collect::<Vec<u8>>();
-                            let filename = String::from_utf8_lossy(&filename_vec);
-
-                            files.insert(Hash::from(checksum), filename.to_string());
-                        };
-
-	            		// Since each chunk can be up to a maximum of 8192 bytes, and the maximum size per game is 10_485_760 bytes, meaning max num of chunks is 1280
-	            		const MAX_NUM_CHUNKS: u64 = 10_485_760 / 8192; // 1280 chunks
-
-	            		if num_chunks <= MAX_NUM_CHUNKS {
-                            software_info = Some(SoftwareInfo { 
-                                username,
-                                auth_cookie,
-                                upload_id,
-                                num_chunks,
-                                files,
-
-                            });
-
-	            		} else {
-                            todo!("{num_chunks}")
-
-	            		}
-
-	            	}
-	            	
-	            },
-	            Err(err) => {
-	                println!("error receiving message {err:?}");
-	                break;
-	            }
-	        };
-	    }
-
-
-
+						if num_chunks <= MAX_NUM_CHUNKS {
+							software_info = Some(SoftwareInfo {
+								username,
+								auth_cookie,
+								upload_id,
+								num_chunks,
+								files,
+							});
+						} else {
+							todo!("{num_chunks}")
+						}
+					}
+				},
+				Err(err) => {
+					println!("error receiving message {err:?}");
+					break;
+				},
+			};
+		}
 	}))
-
 }
 
 #[derive(Deserialize)]
 enum SearchAlg {
-    HighestRated,
-    LowestRated,
-    MostDownloaded,
-    LeastDownloaded,
-    Newest,
-    Oldest,
-    Trending,
-    HighestPrice,
-    LowestPrice,
-
+	HighestRated,
+	LowestRated,
+	MostDownloaded,
+	LeastDownloaded,
+	Newest,
+	Oldest,
+	Trending,
+	HighestPrice,
+	LowestPrice,
 }
-
 
 #[derive(Deserialize)]
 pub struct SearchSoftwareReq {
-    term: String,
-    sort_by: SearchAlg,
-    start_index: u64,
-    num_results: u16,
+	term: String,
+	sort_by: SearchAlg,
+	start_index: u64,
+	num_results: u16,
 }
 
 #[derive(Serialize)]
 struct SearchResult {
-    title: String,
-    item_id: u64,
-    creation_time: u64,
-
+	title: String,
+	item_id: u64,
+	creation_time: u64,
 }
 
 impl From<Item> for SearchResult {
-    fn from(item: Item) -> Self {
-        SearchResult {
-            title: item.title,
-            item_id: item.id,
-            creation_time: item.creation_time.unwrap(),
-
-        }
-       
-    }
-
+	fn from(item: Item) -> Self {
+		SearchResult {
+			title: item.title,
+			item_id: item.id,
+			creation_time: item.creation_time.unwrap(),
+		}
+	}
 }
 
-pub async fn search_software(search_req: SearchSoftwareReq, software_db: SoftwareDB) -> Result<impl Reply, Rejection> {
-    const MAX_NUM_RESULTS: u16 = 100;
+pub async fn search_software(
+	search_req: SearchSoftwareReq, software_db: SoftwareDB,
+) -> Result<impl Reply, Rejection> {
+	const MAX_NUM_RESULTS: u16 = 100;
 
-    if search_req.num_results > MAX_NUM_RESULTS {
-        let denial = RequestDenial::new(DenialFault::User, String::from("Too many results requested"), format!("Try requesting {MAX_NUM_RESULTS} results or less"));
-        return Ok(denial.into_response(StatusCode::BAD_REQUEST));
+	if search_req.num_results > MAX_NUM_RESULTS {
+		let denial = RequestDenial::new(
+			DenialFault::User,
+			String::from("Too many results requested"),
+			format!("Try requesting {MAX_NUM_RESULTS} results or less"),
+		);
+		return Ok(denial.into_response(StatusCode::BAD_REQUEST));
+	}
 
-    }
+	let capacity = software_db.len().min(search_req.num_results.into());
 
-    let capacity = software_db.len().min(search_req.num_results.into());
+	let mut results = Vec::with_capacity(capacity);
 
-    let mut results = Vec::with_capacity(capacity);
+	software_db.iter().for_each(|res| {
+		let (_item_id, item) = res.unwrap();
 
-    software_db.iter().for_each(|res| {
-        let (_item_id, item) = res.unwrap();
-       
-        if item.creation_time.is_some() && item.title.to_lowercase().contains(&search_req.term) {
-            if results.len() < capacity {
-                results.push(item);
+		if item.creation_time.is_some() && item.title.to_lowercase().contains(&search_req.term) {
+			if results.len() < capacity {
+				results.push(item);
+			} else {
+				let search_alg = match search_req.sort_by {
+					SearchAlg::Newest => newest_item,
+					SearchAlg::Oldest => oldest_item,
+					_ => todo!(),
+				};
 
-            } else {
-                let search_alg = match search_req.sort_by {
-                    SearchAlg::Newest => newest_item,
-                    SearchAlg::Oldest => oldest_item,
-                    _ => todo!(),
-                };
+				let worst_item = results.iter_mut().reduce(|item1, item2| {
+					match search_alg(item1, item2) {
+						// We find the worst item by just doing the search algorithm, and seeing
+						// returning the item that is worse (greater)
+						Ordering::Greater => item1,
+						Ordering::Less => item2,
+						Ordering::Equal => item1,
+					}
+				});
 
-                let worst_item = results.iter_mut().reduce(|item1, item2| {
-                    match search_alg(item1, item2) {
-                        // We find the worst item by just doing the search algorithm, and seeing
-                        // returning the item that is worse (greater)
-                        Ordering::Greater => item1,
-                        Ordering::Less => item2,
-                        Ordering::Equal => item1,
-                    }
-                });
+				// If there's only 1 item in the Vec, then just get the first one since it's the
+				// "worst"
+				let worst_item = match worst_item {
+					Some(item) => item,
+					None => results.get_mut(0).unwrap(),
+				};
 
-                // If there's only 1 item in the Vec, then just get the first one since it's the
-                // "worst" 
-                let worst_item = match worst_item {
-                    Some(item) => item,
-                    None => results.get_mut(0).unwrap(),
-                };
+				if search_alg(&item, worst_item) == Ordering::Less {
+					*worst_item = item;
+				}
+			}
+		}
+	});
 
-                
-                if search_alg(&item, worst_item) == Ordering::Less {
-                    *worst_item = item;
+	let results: Vec<SearchResult> = results
+		.into_iter()
+		.map(|item| {
+			let result: SearchResult = item.into();
+			result
+		})
+		.collect();
 
-                }
-            }
-        }
-
-    });
-
-    let results: Vec<SearchResult> = results.into_iter().map(|item| {
-        let result: SearchResult = item.into();
-        result
-
-    }).collect();
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .body(simd_json::to_string(&results).unwrap())
-        .unwrap())
-
+	Ok(Response::builder()
+		.status(StatusCode::OK)
+		.body(simd_json::to_string(&results).unwrap())
+		.unwrap())
 }
 
 fn newest_item(item1: &Item, item2: &Item) -> Ordering {
-    item2.id.cmp(&item1.id)
+	item2.id.cmp(&item1.id)
 }
 
 fn oldest_item(item1: &Item, item2: &Item) -> Ordering {
-    item1.id.cmp(&item2.id)
-
+	item1.id.cmp(&item2.id)
 }
 
 pub struct SoftwareInfo {
-    username: String,
+	username: String,
 	auth_cookie: String,
 	upload_id: [u8; 32],
-    num_chunks: u64,
-    files: HashMap<blake3::Hash, String>, 
+	num_chunks: u64,
+	files: HashMap<blake3::Hash, String>,
 }
 
 pub struct ChunkInfo {
@@ -585,8 +619,7 @@ pub struct Item {
 	compressed_size: u64,
 	price: ItemPrice,
 	compression_type: CompressionType,
-    files: HashMap<[u8; 32], String>,
+	files: HashMap<[u8; 32], String>,
 	upload_id: Option<[u8; 32]>,
-    creation_time: Option<u64>,
+	creation_time: Option<u64>,
 }
-
