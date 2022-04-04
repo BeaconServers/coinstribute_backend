@@ -7,15 +7,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrayvec::ArrayString;
 use blake3::Hash;
-use futures::{FutureExt, StreamExt};
+use futures_util::{SinkExt, StreamExt};
 use rand::prelude::*;
 // use rayon::prelude::*;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
 use warp::hyper::{Response, StatusCode};
+use warp::ws::Message;
 use warp::{Rejection, Reply};
 
 use crate::auth::verify_auth_cookie;
@@ -33,7 +32,7 @@ pub enum ArchType {
 /// This means that for the web version of the site, it can't be used. As an alternative, Brotli is used instead
 #[derive(Clone, Serialize, Deserialize)]
 pub enum CompressionType {
-	ZSTD,
+	Zstd,
 	Brotli,
 }
 
@@ -172,16 +171,7 @@ pub async fn upload_software(
 	websocket: warp::ws::Ws, cookie_db: CookieDB, upload_id_db: UploadIdDB, software_db: SoftwareDB,
 ) -> Result<impl Reply, Rejection> {
 	Ok(websocket.on_upgrade(|ws| async move {
-		let (cli_ws_snd, mut cli_ws_rcv) = ws.split();
-		let (_cli_snd, cli_rcv) = mpsc::unbounded_channel();
-
-		let cli_rcv = UnboundedReceiverStream::new(cli_rcv);
-
-		tokio::task::spawn(cli_rcv.forward(cli_ws_snd).map(|result| {
-			if let Err(e) = result {
-				println!("error sending websocket msg: {}", e);
-			}
-		}));
+		let (_cli_ws_snd, mut cli_ws_rcv) = ws.split();
 
 		let mut software_info: Option<SoftwareInfo> = None;
 
@@ -192,7 +182,7 @@ pub async fn upload_software(
 		const CHUNK_BUFFER_LEN: usize = 65535;
 		let mut chunk_buffer = [0_u8; CHUNK_BUFFER_LEN];
 
-        let mut file_hashes_seen: HashSet<[u8; 32]> = HashSet::new();
+		let mut file_hashes_seen: HashSet<[u8; 32]> = HashSet::new();
 
 		'connection: while let Some(result) = cli_ws_rcv.next().await {
 			match result {
@@ -277,7 +267,7 @@ pub async fn upload_software(
 							software_db.insert(&software_id, &software_item).unwrap();
 
 							println!("Added software");
-                            //TODO: Remove upload id n stuff like that
+							// TODO: Remove upload id n stuff like that
 							break 'connection;
 						}
 
@@ -312,8 +302,8 @@ pub async fn upload_software(
 								file.flush().await.unwrap();
 								file.shutdown().await.unwrap();
 
-                                // Check if this is the first chunk being uploaded for the file
-                                let is_first_chunk = file_hashes_seen.insert(*file_hash.as_bytes());
+								// Check if this is the first chunk being uploaded for the file
+								let is_first_chunk = file_hashes_seen.insert(*file_hash.as_bytes());
 
 								if is_first_chunk && !infer::is(chunk_buffer, "zst") {
 									tokio::fs::remove_file(path).await.unwrap();
@@ -563,6 +553,104 @@ pub async fn search_software(
 		.status(StatusCode::OK)
 		.body(simd_json::to_string(&results).unwrap())
 		.unwrap())
+}
+
+pub async fn download_software(
+	websocket: warp::ws::Ws, cookie_db: CookieDB, software_db: SoftwareDB,
+) -> Result<impl Reply, Rejection> {
+	Ok(websocket.on_upgrade(|ws| async move {
+		let (mut cli_ws_snd, mut cli_ws_rcv) = ws.split();
+
+		'connection: while let Some(result) = cli_ws_rcv.next().await {
+			match result {
+				Ok(msg) => {
+					let msg = msg.as_bytes();
+
+					// The first 32 bytes is the auth cookie, andt the final 8 bytes is the id of the software they want to download
+					if msg.len() == 0 {
+						println!("Closing connection");
+						break 'connection;
+					}
+
+					let username_end_index = msg.iter().position(|b| *b == 0_u8).unwrap();
+					let username = String::from_utf8(msg[..username_end_index].to_vec()).unwrap();
+					// TODO: DONT JUST ASSUME AUTH COOKIE IS 50 BYTES, THIS IS LAZY
+					let auth_cookie = String::from_utf8(
+						msg[username_end_index + 1..username_end_index + 1 + 50].to_vec(),
+					)
+					.unwrap();
+
+					if !verify_auth_cookie(&username, &auth_cookie, &cookie_db) {
+						eprintln!("Invalid auth cookie");
+						break 'connection;
+					}
+
+					let software_id = u64::from_le_bytes(
+						msg[username_end_index + 52..username_end_index + 52 + 8]
+							.try_into()
+							.unwrap(),
+					);
+					let software_info = match software_db.get(&software_id).unwrap() {
+						Some(item) => item,
+						None => {
+							eprintln!("Software not found");
+							break 'connection;
+						},
+					};
+
+					for (file_hash, file_name) in software_info.files.iter() {
+						let file_hash_hex =
+							hex_simd::encode_to_boxed_str(file_hash, hex_simd::AsciiCase::Lower);
+						let mut file_path = PathBuf::new();
+						file_path.push("./.game_files/");
+						file_path.push(&*file_hash_hex);
+
+						let mut file = tokio::fs::OpenOptions::new()
+							.read(true)
+							.open(file_path)
+							.await
+							.unwrap();
+						let file_size = {
+							let file_metadata = file.metadata().await.unwrap();
+							file_metadata.len()
+						};
+
+						// First, send the path that the file should be saved to on the client side
+						// as well as the size of the file
+						let mut message = Vec::with_capacity(32 + file_name.len() + 1 + 8);
+						message.extend_from_slice(file_hash);
+						message.extend_from_slice(file_name.as_bytes());
+						message.push(0);
+						message.extend_from_slice(&file_size.to_le_bytes());
+
+						cli_ws_snd.send(Message::binary(message)).await.unwrap();
+
+						// Then, start reading the file and sending it over the network
+						let mut file_buffer = [0_u8; 8192];
+
+						'read_loop: loop {
+							match file.read(&mut file_buffer).await {
+								Ok(0) => break 'read_loop,
+								Ok(n) => {
+									cli_ws_snd
+										.send(Message::binary(&file_buffer[..n]))
+										.await
+										.unwrap();
+								},
+								Err(e) => eprintln!("{e:?}"),
+							};
+						}
+					}
+
+					println!("Finished sending files");
+				},
+				Err(err) => {
+					eprintln!("Error while downloading software: {err}");
+					break 'connection;
+				},
+			};
+		}
+	}))
 }
 
 fn newest_item(item1: &Item, item2: &Item) -> Ordering {

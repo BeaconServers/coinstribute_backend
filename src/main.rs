@@ -229,6 +229,12 @@ fn main() {
 		.and(software_db_filter.clone())
 		.and_then(search_software);
 
+	let download_software = warp::path("download_software")
+		.and(warp::ws())
+		.and(cookie_db_filter.clone())
+		.and(software_db_filter.clone())
+		.and_then(download_software);
+
 	let create_captcha = warp::path("create_captcha")
 		.and(captcha_db_filter.clone())
 		.map(create_captcha);
@@ -291,6 +297,7 @@ fn main() {
 			post_routes
 				.with(cors.clone())
 				.or(upload_software.with(cors.clone()))
+				.or(download_software.with(cors.clone()))
 				.or(get_routes.with(cors))
 				.recover(handle_rejection),
 		)
