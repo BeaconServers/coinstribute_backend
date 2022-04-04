@@ -1,9 +1,9 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrayvec::ArrayString;
 use blake3::Hash;
@@ -167,6 +167,7 @@ pub fn new_software(
 }
 
 // TODO: Replace all the sudden disconnects with sending errors back to the client
+// TODO: Remove all cached files on sudden breaks or disconnects or errors or whatever
 pub async fn upload_software(
 	websocket: warp::ws::Ws, cookie_db: CookieDB, upload_id_db: UploadIdDB, software_db: SoftwareDB,
 ) -> Result<impl Reply, Rejection> {
@@ -190,7 +191,8 @@ pub async fn upload_software(
 
 		const CHUNK_BUFFER_LEN: usize = 65535;
 		let mut chunk_buffer = [0_u8; CHUNK_BUFFER_LEN];
-		let mut checked_zstd = false;
+
+        let mut file_hashes_seen: HashSet<[u8; 32]> = HashSet::new();
 
 		'connection: while let Some(result) = cli_ws_rcv.next().await {
 			match result {
@@ -249,7 +251,6 @@ pub async fn upload_software(
 									panic!("Hash: {}\nComputed Hash: {}", hash, computed_hash);
 								}
 
-								// Just decompresses the file to /dev/null
 								tokio::fs::copy(&src_path, &dst_path).await.unwrap();
 								remove_cached_files().await;
 
@@ -276,6 +277,7 @@ pub async fn upload_software(
 							software_db.insert(&software_id, &software_item).unwrap();
 
 							println!("Added software");
+                            //TODO: Remove upload id n stuff like that
 							break 'connection;
 						}
 
@@ -310,8 +312,10 @@ pub async fn upload_software(
 								file.flush().await.unwrap();
 								file.shutdown().await.unwrap();
 
-								if !checked_zstd && !infer::is(chunk_buffer, "zst") {
-									checked_zstd = true;
+                                // Check if this is the first chunk being uploaded for the file
+                                let is_first_chunk = file_hashes_seen.insert(*file_hash.as_bytes());
+
+								if is_first_chunk && !infer::is(chunk_buffer, "zst") {
 									tokio::fs::remove_file(path).await.unwrap();
 									panic!("The file given is NOT a zst file");
 								}
