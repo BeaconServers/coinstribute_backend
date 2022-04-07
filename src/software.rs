@@ -1,8 +1,9 @@
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+// TODO: Use UTC time library
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrayvec::ArrayString;
@@ -12,13 +13,23 @@ use rand::prelude::*;
 // use rayon::prelude::*;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use warp::hyper::{Response, StatusCode};
 use warp::ws::Message;
 use warp::{Rejection, Reply};
 
 use crate::auth::verify_auth_cookie;
-use crate::db::{AuthDB, CaptchaDB, CookieDB, SoftwareDB, UploadIdDB, DB};
+use crate::db::{
+	AuthDB,
+	CaptchaDB,
+	CookieDB,
+	DownloadCountDB,
+	SoftwareDB,
+	SoftwareOwnershipDB,
+	UploadIdDB,
+	DB,
+};
 use crate::{DenialFault, RequestDenial};
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -106,14 +117,14 @@ pub fn new_software(
 		return denial.into_response(StatusCode::UNAUTHORIZED);
 	}
 
-	// While obviously modified clients can just lie about how large the game's size is, there are strict checks when actually uplaoading the game to ensure that the file is the exact size specified
-	if new_software_req.compressed_size > 10_000_000
-	// 10 MB
+	// While obviously modified clients can just lie about how large the game's size is, there are strict checks when actually uploading the game to ensure that the file is the exact size specified
+	if new_software_req.compressed_size > 10_485_760
+	// 10 MiB
 	{
 		let denial = RequestDenial::new(
 			DenialFault::User,
 			String::from("File is too large"),
-			"Please keep your compressed game files under 10 MB".to_string(),
+			"Please keep your compressed game files under 10 MiB".to_string(),
 		);
 		return denial.into_response(StatusCode::BAD_REQUEST);
 	}
@@ -173,8 +184,9 @@ pub async fn upload_software(
 	Ok(websocket.on_upgrade(|ws| async move {
 		let (_cli_ws_snd, mut cli_ws_rcv) = ws.split();
 
-		let mut software_info: Option<SoftwareInfo> = None;
+		let mut software_info: Option<(SoftwareInfo, Item)> = None;
 
+		let mut total_size = 0;
 		let mut num_chunks = 0;
 		let mut amt_written_to_buffer = 0;
 		let mut chunk_info: Option<ChunkInfo> = None;
@@ -189,7 +201,7 @@ pub async fn upload_software(
 				Ok(msg) => {
 					let msg = msg.as_bytes();
 
-					if let Some(software_info) = software_info.as_ref() {
+					if let Some((software_info, software_item)) = software_info.as_mut() {
 						if num_chunks == software_info.num_chunks {
 							for (hash, _file) in software_info.files.iter() {
 								let mut src_path = PathBuf::new();
@@ -248,10 +260,6 @@ pub async fn upload_software(
 							}
 
 							// When all of the files are properly checksummed, finish up.
-							let software_id =
-								upload_id_db.get(&software_info.upload_id).unwrap().unwrap();
-							let mut software_item = software_db.get(&software_id).unwrap().unwrap();
-
 							software_item.files = software_info
 								.files
 								.iter()
@@ -264,7 +272,9 @@ pub async fn upload_software(
 									.as_secs(),
 							);
 
-							software_db.insert(&software_id, &software_item).unwrap();
+							software_db
+								.insert(&software_item.id, &software_item)
+								.unwrap();
 
 							println!("Added software");
 							// TODO: Remove upload id n stuff like that
@@ -279,6 +289,13 @@ pub async fn upload_software(
 
 							let amt_written_to_buffer_as_u64: u64 =
 								amt_written_to_buffer.try_into().unwrap();
+
+							total_size += amt_written_to_buffer_as_u64;
+
+							if total_size > software_item.compressed_size {
+								eprintln!("Software info size doesn't match given size");
+								break 'connection;
+							}
 
 							if amt_written_to_buffer_as_u64 == chunk_info_ref.len {
 								// When we've finished writing a single chunk to memory, begin
@@ -427,13 +444,19 @@ pub async fn upload_software(
 						const MAX_NUM_CHUNKS: u64 = 10_485_760 / 8192; // 1280 chunks
 
 						if num_chunks <= MAX_NUM_CHUNKS {
-							software_info = Some(SoftwareInfo {
-								username,
-								auth_cookie,
-								upload_id,
-								num_chunks,
-								files,
-							});
+							let software_id = upload_id_db.get(&upload_id).unwrap().unwrap();
+							let software_item = software_db.get(&software_id).unwrap().unwrap();
+
+							software_info = Some((
+								SoftwareInfo {
+									username,
+									auth_cookie,
+									upload_id,
+									num_chunks,
+									files,
+								},
+								software_item,
+							));
 						} else {
 							todo!("{num_chunks}")
 						}
@@ -474,20 +497,28 @@ struct SearchResult {
 	title: String,
 	item_id: u64,
 	creation_time: u64,
+	num_downloads: u64,
 }
 
-impl From<Item> for SearchResult {
-	fn from(item: Item) -> Self {
+impl SearchResult {
+	fn from_item(item: Item, download_count_db: &DownloadCountDB) -> Self {
 		SearchResult {
 			title: item.title,
 			item_id: item.id,
 			creation_time: item.creation_time.unwrap(),
+			num_downloads: download_count_db
+				.get_or_insert(&item.id, &SoftwareDownloads(BTreeSet::new()))
+				.unwrap()
+				.0
+				.len()
+				.try_into()
+				.unwrap(),
 		}
 	}
 }
 
 pub async fn search_software(
-	search_req: SearchSoftwareReq, software_db: SoftwareDB,
+	search_req: SearchSoftwareReq, software_db: SoftwareDB, download_count_db: DownloadCountDB,
 ) -> Result<impl Reply, Rejection> {
 	const MAX_NUM_RESULTS: u16 = 100;
 
@@ -514,11 +545,13 @@ pub async fn search_software(
 				let search_alg = match search_req.sort_by {
 					SearchAlg::Newest => newest_item,
 					SearchAlg::Oldest => oldest_item,
+					SearchAlg::MostDownloaded => most_downloaded_item,
+					SearchAlg::LeastDownloaded => least_downloaded_item,
 					_ => todo!(),
 				};
 
 				let worst_item = results.iter_mut().reduce(|item1, item2| {
-					match search_alg(item1, item2) {
+					match search_alg(item1, item2, &download_count_db) {
 						// We find the worst item by just doing the search algorithm, and seeing
 						// returning the item that is worse (greater)
 						Ordering::Greater => item1,
@@ -534,7 +567,7 @@ pub async fn search_software(
 					None => results.get_mut(0).unwrap(),
 				};
 
-				if search_alg(&item, worst_item) == Ordering::Less {
+				if search_alg(&item, worst_item, &download_count_db) == Ordering::Less {
 					*worst_item = item;
 				}
 			}
@@ -543,10 +576,7 @@ pub async fn search_software(
 
 	let results: Vec<SearchResult> = results
 		.into_iter()
-		.map(|item| {
-			let result: SearchResult = item.into();
-			result
-		})
+		.map(|item| SearchResult::from_item(item, &download_count_db))
 		.collect();
 
 	Ok(Response::builder()
@@ -555,8 +585,53 @@ pub async fn search_software(
 		.unwrap())
 }
 
+// For each SoftwareItem, the database contains a list of users who have downloaded that software
+// and the time they downloaded it. Thanks to BTreeSet and my magic ordering, it should sort itself
+#[derive(Serialize, Deserialize)]
+pub struct SoftwareDownloads(pub BTreeSet<SoftwareDownload>);
+
+// I do this so the BTreeSet only sorts by the time, but I can still store the username
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+pub struct SoftwareDownload {
+	time: UnixTimeUTC,
+	username: String,
+}
+
+impl PartialOrd for SoftwareDownload {
+	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+		Some(self.cmp(other))
+	}
+}
+
+impl Ord for SoftwareDownload {
+	fn cmp(&self, other: &Self) -> Ordering {
+		self.time.cmp(&other.time)
+	}
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct UnixTimeUTC(pub u64);
+
+impl UnixTimeUTC {
+	fn now_utc() -> Self {
+		let time = OffsetDateTime::now_utc();
+		let unix_time: u64 = time.unix_timestamp().try_into().unwrap();
+
+		Self(unix_time)
+	}
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SoftwareOwnershipInfoList(HashMap<u64, OwnershipInfo>);
+
+#[derive(Serialize, Deserialize)]
+pub struct OwnershipInfo {
+	downloaded: bool,
+}
+
 pub async fn download_software(
 	websocket: warp::ws::Ws, cookie_db: CookieDB, software_db: SoftwareDB,
+	download_db: DownloadCountDB, ownership_db: SoftwareOwnershipDB,
 ) -> Result<impl Reply, Rejection> {
 	Ok(websocket.on_upgrade(|ws| async move {
 		let (mut cli_ws_snd, mut cli_ws_rcv) = ws.split();
@@ -567,7 +642,7 @@ pub async fn download_software(
 					let msg = msg.as_bytes();
 
 					// The first 32 bytes is the auth cookie, andt the final 8 bytes is the id of the software they want to download
-					if msg.len() == 0 {
+					if msg.is_empty() {
 						println!("Closing connection");
 						break 'connection;
 					}
@@ -637,10 +712,59 @@ pub async fn download_software(
 										.await
 										.unwrap();
 								},
-								Err(e) => eprintln!("{e:?}"),
+								Err(ref err) => match err.kind() {
+									tokio::io::ErrorKind::Interrupted => continue,
+									_ => panic!("{err}"),
+								},
 							};
 						}
 					}
+
+					let add_to_download_count = || {
+						let mut downloads = match download_db.get(&software_id).unwrap() {
+							Some(downloads) => downloads,
+							None => SoftwareDownloads(BTreeSet::new()),
+						};
+
+						let download_info = SoftwareDownload {
+							username: username.clone(),
+							time: UnixTimeUTC::now_utc(),
+						};
+
+						downloads.0.insert(download_info);
+						download_db.insert(&software_id, &downloads).unwrap();
+
+						println!(
+							"{} total downloads for software_id: {software_id}",
+							downloads.0.len()
+						);
+					};
+
+					let mut ownership_info_list = ownership_db
+						.get_or_insert(&username, &SoftwareOwnershipInfoList(HashMap::new()))
+						.unwrap();
+
+					match ownership_info_list.0.get_mut(&software_id) {
+						Some(ownership_info) => {
+							if !ownership_info.downloaded {
+								add_to_download_count();
+								ownership_info.downloaded = true;
+							}
+						},
+						None => {
+							ownership_info_list.0.insert(
+								software_id,
+								OwnershipInfo {
+									downloaded: true,
+								},
+							);
+							add_to_download_count();
+						},
+					};
+
+					ownership_db
+						.insert(&username, &ownership_info_list)
+						.unwrap();
 
 					println!("Finished sending files");
 				},
@@ -653,12 +777,38 @@ pub async fn download_software(
 	}))
 }
 
-fn newest_item(item1: &Item, item2: &Item) -> Ordering {
+fn newest_item(item1: &Item, item2: &Item, _download_count_db: &DownloadCountDB) -> Ordering {
 	item2.id.cmp(&item1.id)
 }
 
-fn oldest_item(item1: &Item, item2: &Item) -> Ordering {
+fn oldest_item(item1: &Item, item2: &Item, _download_count_db: &DownloadCountDB) -> Ordering {
 	item1.id.cmp(&item2.id)
+}
+
+fn most_downloaded_item(
+	item1: &Item, item2: &Item, download_count_db: &DownloadCountDB,
+) -> Ordering {
+	let count1 = download_count_db
+		.get_or_insert(&item1.id, &SoftwareDownloads(BTreeSet::new()))
+		.unwrap();
+	let count2 = download_count_db
+		.get_or_insert(&item2.id, &SoftwareDownloads(BTreeSet::new()))
+		.unwrap();
+
+	count2.0.len().cmp(&count1.0.len())
+}
+
+fn least_downloaded_item(
+	item1: &Item, item2: &Item, download_count_db: &DownloadCountDB,
+) -> Ordering {
+	let count1 = download_count_db
+		.get_or_insert(&item1.id, &SoftwareDownloads(BTreeSet::new()))
+		.unwrap();
+	let count2 = download_count_db
+		.get_or_insert(&item2.id, &SoftwareDownloads(BTreeSet::new()))
+		.unwrap();
+
+	count1.0.len().cmp(&count2.0.len())
 }
 
 pub struct SoftwareInfo {

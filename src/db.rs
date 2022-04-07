@@ -5,7 +5,7 @@ use sled::{Batch, Result, Tree};
 
 use crate::auth::{AuthCookie, GeneratedCaptcha, User};
 use crate::money::FinancialInfo;
-use crate::software::Item;
+use crate::software::{Item, SoftwareDownloads, SoftwareOwnershipInfoList};
 
 #[derive(Clone)]
 pub struct AuthDB(pub Tree);
@@ -21,8 +21,12 @@ pub struct CaptchaDB(pub Tree);
 pub struct SoftwareDB(pub Tree);
 #[derive(Clone)]
 pub struct UploadIdDB(pub Tree);
+#[derive(Clone)]
+pub struct DownloadCountDB(pub Tree);
+#[derive(Clone)]
+pub struct SoftwareOwnershipDB(pub Tree);
 
-pub trait DB<K: serde::Serialize + DeserializeOwned, V: Serialize + DeserializeOwned> {
+pub trait DB<K: Serialize + DeserializeOwned, V: Serialize + DeserializeOwned> {
 	fn new(tree: Tree) -> Self;
 	fn get_tree(&self) -> &Tree;
 	fn contains_key(&self, key: &K) -> Result<bool> {
@@ -69,6 +73,22 @@ pub trait DB<K: serde::Serialize + DeserializeOwned, V: Serialize + DeserializeO
 				Ok(Some(val))
 			},
 			None => Ok(None),
+		}
+	}
+
+	fn get_or_insert(&self, key: &K, value: &V) -> sled::Result<V> {
+		match self.get(key)? {
+			Some(v) => Ok(v),
+			None => {
+				let key_bytes = bincode::serialize(key).unwrap();
+				let val_bytes = bincode::serialize(value).unwrap();
+
+				let value = bincode::deserialize(&val_bytes).unwrap();
+
+				self.get_tree().insert(key_bytes, val_bytes).unwrap();
+
+				Ok(value)
+			},
 		}
 	}
 
@@ -164,6 +184,26 @@ impl DB<u64, Item> for SoftwareDB {
 }
 
 impl DB<[u8; blake3::OUT_LEN], u64> for UploadIdDB {
+	fn new(tree: Tree) -> Self {
+		Self(tree)
+	}
+
+	fn get_tree(&self) -> &Tree {
+		&self.0
+	}
+}
+
+impl DB<u64, SoftwareDownloads> for DownloadCountDB {
+	fn new(tree: Tree) -> Self {
+		Self(tree)
+	}
+
+	fn get_tree(&self) -> &Tree {
+		&self.0
+	}
+}
+
+impl DB<String, SoftwareOwnershipInfoList> for SoftwareOwnershipDB {
 	fn new(tree: Tree) -> Self {
 		Self(tree)
 	}

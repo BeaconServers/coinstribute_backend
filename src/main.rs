@@ -66,6 +66,14 @@ fn main() {
 		db.open_tree(b"upload_id_db")
 			.expect("Failed to open upload_id_db, time to panic!"),
 	);
+	let download_count_db = DownloadCountDB::new(
+		db.open_tree(b"download_count_db")
+			.expect("Failed to open download_count_db, time to panic!"),
+	);
+	let software_ownership_db = SoftwareOwnershipDB::new(
+		db.open_tree(b"software_ownership_db")
+			.expect("Failed to open software_ownership_db, time to panic!"),
+	);
 
 	let all_transfers: Arc<RwLock<Vec<Transfers>>> = Arc::new(RwLock::new(Vec::new()));
 	let current_software_id: Arc<AtomicU64> = Arc::new(AtomicU64::new(
@@ -106,6 +114,15 @@ fn main() {
 		let db = upload_id_db.clone();
 		warp::any().map(move || db.clone())
 	};
+	let download_count_db_filter = {
+		let db = download_count_db.clone();
+		warp::any().map(move || db.clone())
+	};
+	let software_ownership_db_filter = {
+		let db = software_ownership_db.clone();
+		warp::any().map(move || db.clone())
+	};
+
 	let captcha_db_filter = {
 		let captcha_db = captcha_db.clone();
 		warp::any().map(move || captcha_db.clone())
@@ -227,12 +244,15 @@ fn main() {
 		.and(warp::body::content_length_limit(2048))
 		.and(warp::body::json())
 		.and(software_db_filter.clone())
+		.and(download_count_db_filter.clone())
 		.and_then(search_software);
 
 	let download_software = warp::path("download_software")
 		.and(warp::ws())
 		.and(cookie_db_filter.clone())
 		.and(software_db_filter.clone())
+		.and(download_count_db_filter.clone())
+		.and(software_ownership_db_filter.clone())
 		.and_then(download_software);
 
 	let create_captcha = warp::path("create_captcha")

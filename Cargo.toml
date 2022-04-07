@@ -29,6 +29,8 @@ opt-level = 3
 arrayvec = { version = "0.7", features = ["serde"] }
 # For easy binary serialization and deserialization
 bincode = { version = "1" }
+# A timezone aware time library
+time = { version = "0.3", features = ["serde"] }
 # Lots of Monero primitives to make workign with addresses easier
 monero = { version = "0.16", default-features = false, features = ["serde_support"] }
 # Useful async lib
