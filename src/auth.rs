@@ -1,11 +1,12 @@
 use std::fmt::Display;
 use std::net::SocketAddr;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use arrayvec::ArrayString;
 use rand::distributions::Alphanumeric;
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 use tokio::sync::mpsc::Sender;
 use warp::http::Response;
 use warp::hyper::StatusCode;
@@ -399,11 +400,10 @@ fn generate_auth_cookie(
 			.collect();
 
 		const NINETY_DAYS_AS_SECS: u64 = 7776000;
-		// Calling unwrap here since if SystemTime > UNIX_EPOCH, we have wayyyy bigger problems
-		let creation_time = SystemTime::now()
-			.duration_since(SystemTime::UNIX_EPOCH)
-			.unwrap()
-			.as_secs();
+		let creation_time: u64 = OffsetDateTime::now_utc()
+			.unix_timestamp()
+			.try_into()
+			.unwrap();
 
 		let auth_cookie = AuthCookie {
 			username: username.to_string(),
@@ -507,10 +507,10 @@ pub(crate) fn destroy_expired_auth_cookies(auth_cookie_db: CookieDB) {
 	loop {
 		use std::thread::sleep;
 
-		let current_time = SystemTime::now()
-			.duration_since(SystemTime::UNIX_EPOCH)
-			.unwrap()
-			.as_secs();
+		let current_time: u64 = OffsetDateTime::now_utc()
+			.unix_timestamp()
+			.try_into()
+			.unwrap();
 
 		// Loops through the auth cookie database and deletes any expired auth cookies, then waits a second
 		auth_cookie_db.iter().for_each(|auth_cookie_key_val| {
@@ -549,10 +549,10 @@ pub fn create_captcha(captcha_db: CaptchaDB) -> Response<String> {
 	};
 	let captcha_hash_hex = captcha_hash.to_hex();
 
-	let creation_time = SystemTime::now()
-		.duration_since(UNIX_EPOCH)
-		.unwrap()
-		.as_secs();
+	let creation_time: u64 = OffsetDateTime::now_utc()
+		.unix_timestamp()
+		.try_into()
+		.unwrap();
 
 	let captcha = GeneratedCaptcha {
 		creation_time,
@@ -666,10 +666,10 @@ pub fn destroy_expired_captchas(captcha_db: CaptchaDB) {
 			return;
 		}
 
-		let time = SystemTime::now()
-			.duration_since(UNIX_EPOCH)
-			.unwrap()
-			.as_secs();
+		let time: u64 = OffsetDateTime::now_utc()
+			.unix_timestamp()
+			.try_into()
+			.unwrap();
 
 		captcha_db.iter().for_each(|captcha| {
 			let (hash, captcha) = captcha.unwrap();

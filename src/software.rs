@@ -4,8 +4,6 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-// TODO: Use UTC time library
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrayvec::ArrayString;
 use blake3::{Hash, Hasher};
@@ -19,7 +17,6 @@ use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc::Sender;
 use warp::hyper::{Response, StatusCode};
-use warp::reject::Reject;
 use warp::ws::Message;
 use warp::{Rejection, Reply};
 
@@ -289,10 +286,10 @@ pub async fn upload_software(
 									.map(|(k, v)| (*k.as_bytes(), v.clone()))
 									.collect();
 								software_item.creation_time = Some(
-									SystemTime::now()
-										.duration_since(UNIX_EPOCH)
-										.unwrap()
-										.as_secs(),
+									OffsetDateTime::now_utc()
+										.unix_timestamp()
+										.try_into()
+										.unwrap(),
 								);
 
 								software_db

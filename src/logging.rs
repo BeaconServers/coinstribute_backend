@@ -3,10 +3,11 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use monero::Address;
 use serde::Serialize;
+use time::OffsetDateTime;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::error::SendError;
@@ -32,10 +33,10 @@ impl Log {
 	) -> Self {
 		Self {
 			username,
-			time: SystemTime::now()
-				.duration_since(UNIX_EPOCH)
-				.unwrap()
-				.as_secs(),
+			time: OffsetDateTime::now_utc()
+				.unix_timestamp()
+				.try_into()
+				.unwrap(),
 			log_type,
 			ip,
 			event,
