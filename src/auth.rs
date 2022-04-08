@@ -591,7 +591,7 @@ pub fn view_captcha(hash: String, captcha_db: CaptchaDB) -> Response<Vec<u8>> {
 		Some(captcha) => Response::builder()
 			.header("content-type", "image/png")
 			.status(StatusCode::OK)
-			.body(captcha.image.clone())
+			.body(captcha.image)
 			.unwrap(),
 
 		None => Response::builder()

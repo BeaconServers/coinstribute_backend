@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -7,15 +8,18 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrayvec::ArrayString;
-use blake3::Hash;
+use blake3::{Hash, Hasher};
 use futures_util::{SinkExt, StreamExt};
 use rand::prelude::*;
 // use rayon::prelude::*;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
+use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::mpsc::Sender;
 use warp::hyper::{Response, StatusCode};
+use warp::reject::Reject;
 use warp::ws::Message;
 use warp::{Rejection, Reply};
 
@@ -30,6 +34,7 @@ use crate::db::{
 	UploadIdDB,
 	DB,
 };
+use crate::logging::{Event, Log, LogType, Priority};
 use crate::{DenialFault, RequestDenial};
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -148,6 +153,16 @@ pub fn new_software(
 
 	let upload_id_str = upload_id_hash.to_hex();
 
+	let mut image_hash_bytes = [0_u8; 32];
+
+	// A generic image of a controller
+	let boxed_image_hash_bytes = hex_simd::decode_to_boxed_bytes(
+		"6651eb8fd8216a717634973da55a5971dc15b29efc37cdc2d7f70bb9a45acf5f".as_bytes(),
+	)
+	.unwrap();
+
+	image_hash_bytes.copy_from_slice(&boxed_image_hash_bytes);
+
 	let game = Item {
 		id: software_id,
 		title: new_software_req.title,
@@ -161,6 +176,7 @@ pub fn new_software(
 		upload_id: Some(upload_id_bytes),
 		// Since the software hasn't been uploaded yet, it hasn't been created
 		creation_time: None,
+		title_image_hash: image_hash_bytes,
 	};
 
 	software_db.insert(&software_id, &game).unwrap();
@@ -190,6 +206,11 @@ pub async fn upload_software(
 		let mut num_chunks = 0;
 		let mut amt_written_to_buffer = 0;
 		let mut chunk_info: Option<ChunkInfo> = None;
+		let mut uploaded_image = false;
+		let mut image_hash_info: Option<([u8; 32], Option<File>)> = None;
+		let mut image_hasher = Hasher::new();
+
+		let mut total_image_size = 0;
 
 		const CHUNK_BUFFER_LEN: usize = 65535;
 		let mut chunk_buffer = [0_u8; CHUNK_BUFFER_LEN];
@@ -203,146 +224,202 @@ pub async fn upload_software(
 
 					if let Some((software_info, software_item)) = software_info.as_mut() {
 						if num_chunks == software_info.num_chunks {
-							for (hash, _file) in software_info.files.iter() {
-								let mut src_path = PathBuf::new();
-								src_path.push(".cached_files/");
-								src_path.push(&hash.to_string());
+							if uploaded_image {
+								for (hash, _file) in software_info.files.iter() {
+									let mut src_path = PathBuf::new();
+									src_path.push(".cached_files/");
+									src_path.push(&hash.to_string());
 
-								let source = tokio::fs::OpenOptions::new()
-									.read(true)
-									.open(&src_path)
-									.await
-									.unwrap();
+									let source = tokio::fs::OpenOptions::new()
+										.read(true)
+										.open(&src_path)
+										.await
+										.unwrap();
 
-								let mut dst_path = PathBuf::new();
-								dst_path.push(".game_files/");
-								tokio::fs::create_dir_all(&dst_path).await.unwrap();
+									let mut dst_path = PathBuf::new();
+									dst_path.push(".game_files/");
+									tokio::fs::create_dir_all(&dst_path).await.unwrap();
 
-								dst_path.push(&hash.to_string());
+									dst_path.push(&hash.to_string());
 
-								// Before decompressing, check the hash of the file
+									// Before decompressing, check the hash of the file
 
-								let mut hasher = blake3::Hasher::new();
-								let mut file_src = BufReader::new(source);
-								let buffer = &mut chunk_buffer;
+									let mut hasher = blake3::Hasher::new();
+									let mut file_src = BufReader::new(source);
+									let buffer = &mut chunk_buffer;
 
-								loop {
-									match file_src.read(buffer).await {
-										Ok(0) => break,
-										Ok(n) => hasher.update(&buffer[..n]),
-										Err(ref e) => {
-											if e.kind() == tokio::io::ErrorKind::Interrupted {
-												continue;
-											} else {
-												panic!("{e}");
-											}
-										},
+									loop {
+										match file_src.read(buffer).await {
+											Ok(0) => break,
+											Ok(n) => hasher.update(&buffer[..n]),
+											Err(ref e) => {
+												if e.kind() == tokio::io::ErrorKind::Interrupted {
+													continue;
+												} else {
+													panic!("{e}");
+												}
+											},
+										};
+									}
+
+									let computed_hash = hasher.finalize();
+
+									// corrupted file
+									let remove_cached_files = || async {
+										tokio::fs::remove_file(&src_path).await.unwrap()
 									};
-								}
 
-								let computed_hash = hasher.finalize();
+									if *hash == computed_hash {
+										println!("Hashes are equivalent");
+									} else {
+										remove_cached_files().await;
+										panic!("Hash: {}\nComputed Hash: {}", hash, computed_hash);
+									}
 
-								// corrupted file
-								let remove_cached_files =
-									|| async { tokio::fs::remove_file(&src_path).await.unwrap() };
-
-								if *hash == computed_hash {
-									println!("Hashes are equivalent");
-								} else {
+									tokio::fs::copy(&src_path, &dst_path).await.unwrap();
 									remove_cached_files().await;
-									panic!("Hash: {}\nComputed Hash: {}", hash, computed_hash);
+
+									println!("Finished writing");
 								}
 
-								tokio::fs::copy(&src_path, &dst_path).await.unwrap();
-								remove_cached_files().await;
+								// When all of the files are properly checksummed, finish up.
+								software_item.files = software_info
+									.files
+									.iter()
+									.map(|(k, v)| (*k.as_bytes(), v.clone()))
+									.collect();
+								software_item.creation_time = Some(
+									SystemTime::now()
+										.duration_since(UNIX_EPOCH)
+										.unwrap()
+										.as_secs(),
+								);
 
-								println!("Finished writing");
-							}
-
-							// When all of the files are properly checksummed, finish up.
-							software_item.files = software_info
-								.files
-								.iter()
-								.map(|(k, v)| (*k.as_bytes(), v.clone()))
-								.collect();
-							software_item.creation_time = Some(
-								SystemTime::now()
-									.duration_since(UNIX_EPOCH)
-									.unwrap()
-									.as_secs(),
-							);
-
-							software_db
-								.insert(&software_item.id, &software_item)
-								.unwrap();
-
-							println!("Added software");
-							// TODO: Remove upload id n stuff like that
-							break 'connection;
-						}
-
-						if let Some(chunk_info_ref) = chunk_info.as_ref() {
-							chunk_buffer[..(amt_written_to_buffer + msg.len())]
-								.as_mut()
-								.copy_from_slice(msg);
-							amt_written_to_buffer += msg.len();
-
-							let amt_written_to_buffer_as_u64: u64 =
-								amt_written_to_buffer.try_into().unwrap();
-
-							total_size += amt_written_to_buffer_as_u64;
-
-							if total_size > software_item.compressed_size {
-								eprintln!("Software info size doesn't match given size");
-								break 'connection;
-							}
-
-							if amt_written_to_buffer_as_u64 == chunk_info_ref.len {
-								// When we've finished writing a single chunk to memory, begin
-								// writing it to disk
-								let file_hash = chunk_info_ref.file;
-
-								let chunk_buffer = &chunk_buffer[..amt_written_to_buffer];
-								let mut path = PathBuf::new();
-								path.push(".cached_files/");
-
-								tokio::fs::create_dir_all(path.clone()).await.unwrap();
-								path.push(&file_hash.to_string());
-								let mut file = tokio::fs::OpenOptions::new()
-									.append(true)
-									.create(true)
-									.open(&path)
-									.await
+								software_db
+									.insert(&software_item.id, software_item)
 									.unwrap();
 
-								file.write_all(chunk_buffer).await.unwrap();
-								file.flush().await.unwrap();
-								file.shutdown().await.unwrap();
+								println!("Added software");
+								// TODO: Remove upload id n stuff like that
+								break 'connection;
+							} else if let Some((image_hash_bytes, image_file)) =
+								image_hash_info.as_mut()
+							{
+								while total_image_size < software_info.compressed_image_len {
+									if let Some(image_file) = image_file.as_mut() {
+										image_file.write_all(msg).await.unwrap();
+										image_hasher.update(msg);
+									}
+									// Don't do any file wrrites if the image hash already
+									// exists
 
-								// Check if this is the first chunk being uploaded for the file
-								let is_first_chunk = file_hashes_seen.insert(*file_hash.as_bytes());
-
-								if is_first_chunk && !infer::is(chunk_buffer, "zst") {
-									tokio::fs::remove_file(path).await.unwrap();
-									panic!("The file given is NOT a zst file");
+									let msg_len: u32 = msg.len().try_into().unwrap();
+									total_image_size += msg_len;
 								}
 
-								// Reset the chunk buffer stuff
-								amt_written_to_buffer = 0;
-								chunk_info = None;
+								let calced_image_hash = image_hasher.finalize();
+								if image_file.is_some() &&
+									*calced_image_hash.as_bytes() != *image_hash_bytes
+								{
+									eprintln!("Image hashes don't match!");
+									break 'connection;
+								} else {
+									uploaded_image = true;
+								}
+							} else {
+								// The 32 byte hash of the image
+								let image_hash_bytes: [u8; 32] = msg[..32].try_into().unwrap();
+								let image_hash_hex = hex_simd::encode_to_boxed_str(
+									&image_hash_bytes,
+									hex_simd::AsciiCase::Lower,
+								);
 
-								num_chunks += 1;
+								let mut path = PathBuf::new();
+								path.push("./.game_images/");
+								path.push(&*image_hash_hex);
+
+								let file_exists = File::open(&path).await.is_ok();
+
+								if !file_exists {
+									let file = OpenOptions::new()
+										.create(true)
+										.write(true)
+										.open(&path)
+										.await
+										.unwrap();
+
+									image_hash_info = Some((image_hash_bytes, Some(file)));
+								} else {
+									image_hash_info = Some((image_hash_bytes, None));
+								}
 							}
 						} else {
-							let chunk_info_bytes = &msg;
-							chunk_info = Some(ChunkInfo {
-								len: u64::from_le_bytes(chunk_info_bytes[0..8].try_into().unwrap()),
-								file: {
-									let checksum_array: [u8; 32] =
-										chunk_info_bytes[8..40].try_into().unwrap();
-									Hash::from(checksum_array)
-								},
-							});
+							if let Some(chunk_info_ref) = chunk_info.as_ref() {
+								chunk_buffer[..(amt_written_to_buffer + msg.len())]
+									.as_mut()
+									.copy_from_slice(msg);
+								amt_written_to_buffer += msg.len();
+
+								let amt_written_to_buffer_as_u64: u64 =
+									amt_written_to_buffer.try_into().unwrap();
+
+								total_size += amt_written_to_buffer_as_u64;
+
+								if total_size > software_item.compressed_size {
+									eprintln!("Software info size doesn't match given size");
+									break 'connection;
+								}
+
+								if amt_written_to_buffer_as_u64 == chunk_info_ref.len {
+									// When we've finished writing a single chunk to memory, begin
+									// writing it to disk
+									let file_hash = chunk_info_ref.file;
+
+									let chunk_buffer = &chunk_buffer[..amt_written_to_buffer];
+									let mut path = PathBuf::new();
+									path.push(".cached_files/");
+
+									tokio::fs::create_dir_all(path.clone()).await.unwrap();
+									path.push(&file_hash.to_string());
+									let mut file = tokio::fs::OpenOptions::new()
+										.append(true)
+										.create(true)
+										.open(&path)
+										.await
+										.unwrap();
+
+									file.write_all(chunk_buffer).await.unwrap();
+									file.flush().await.unwrap();
+									file.shutdown().await.unwrap();
+
+									// Check if this is the first chunk being uploaded for the file
+									let is_first_chunk =
+										file_hashes_seen.insert(*file_hash.as_bytes());
+
+									if is_first_chunk && !infer::is(chunk_buffer, "zst") {
+										tokio::fs::remove_file(path).await.unwrap();
+										panic!("The file given is NOT a zst file");
+									}
+
+									// Reset the chunk buffer stuff
+									amt_written_to_buffer = 0;
+									chunk_info = None;
+
+									num_chunks += 1;
+								}
+							} else {
+								let chunk_info_bytes = &msg;
+								chunk_info = Some(ChunkInfo {
+									len: u64::from_le_bytes(
+										chunk_info_bytes[0..8].try_into().unwrap(),
+									),
+									file: {
+										let checksum_array: [u8; 32] =
+											chunk_info_bytes[8..40].try_into().unwrap();
+										Hash::from(checksum_array)
+									},
+								});
+							}
 						}
 					} else {
 						let software_info_bytes = &msg;
@@ -409,12 +486,30 @@ pub async fn upload_software(
 
 						if !upload_id_db.contains_key(&upload_id).unwrap() {
 							eprintln!("Upload ID not found");
-							break;
+							break 'connection;
+						}
+
+						let image_len_bytes: [u8; 4] = software_info_bytes
+							[cookie_end_index + 33..cookie_end_index + 37]
+							.try_into()
+							.unwrap();
+						let compressed_image_len: u32 = u32::from_le_bytes(image_len_bytes);
+
+						// 1 MiB
+						if compressed_image_len > 1048576 {
+							eprintln!("Image too large");
+							break 'connection;
+
+						// Because of ZSTD header stuff, it's impossible for the image to be under
+						// 4 bytes. It'll probably be bigger than this anyway lol
+						} else if compressed_image_len < 4 {
+							eprintln!("Image too small");
+							break 'connection;
 						}
 
 						let mut files = HashMap::new();
 
-						let mut bytes_iter = software_info_bytes[cookie_end_index + 33..].iter();
+						let mut bytes_iter = software_info_bytes[cookie_end_index + 37..].iter();
 
 						loop {
 							let mut checksum = [0; blake3::OUT_LEN];
@@ -454,6 +549,7 @@ pub async fn upload_software(
 									upload_id,
 									num_chunks,
 									files,
+									compressed_image_len,
 								},
 								software_item,
 							));
@@ -816,6 +912,7 @@ pub struct SoftwareInfo {
 	auth_cookie: String,
 	upload_id: [u8; 32],
 	num_chunks: u64,
+	compressed_image_len: u32,
 	files: HashMap<blake3::Hash, String>,
 }
 
@@ -856,4 +953,67 @@ pub struct Item {
 	files: HashMap<[u8; 32], String>,
 	upload_id: Option<[u8; 32]>,
 	creation_time: Option<u64>,
+	title_image_hash: [u8; 32],
+}
+
+// TODO: Make view_captcha use async and look like this function
+pub async fn view_software_image(
+	path: String, ip: Option<SocketAddr>, log_sender: Sender<Log>,
+) -> Result<Box<dyn Reply>, Rejection> {
+	let mut path_bytes = path.clone().into_bytes();
+
+	// Make sure the path given is 32 byte hex
+	if path.len() == 64 && hex_simd::decode_inplace(&mut path_bytes).is_ok() {
+		let mut full_path = PathBuf::new();
+		full_path.push("./.game_images/");
+		full_path.push(&path);
+
+		match File::open(&full_path).await {
+			Ok(mut file) => {
+				let mut bytes = Vec::new();
+				file.read_to_end(&mut bytes).await.unwrap();
+
+				Ok(Box::new(Response::builder().body(bytes).unwrap()))
+			},
+			Err(err) => match err.kind() {
+				tokio::io::ErrorKind::NotFound => {
+					let denial = RequestDenial::new(
+						DenialFault::User,
+						"Image not found".to_string(),
+						String::new(),
+					);
+
+					Ok(Box::new(denial.into_response(StatusCode::NOT_FOUND)))
+				},
+				_ => {
+					Log::new(
+						None,
+						ip.unwrap().ip(),
+						Event::ServerError,
+						LogType::Auth,
+						err.to_string(),
+						Priority::Medium,
+					)
+					.send(&log_sender)
+					.await;
+					let denial = RequestDenial::new(
+						DenialFault::Server,
+						"Internal Server Error".to_string(),
+						String::new(),
+					);
+					Ok(Box::new(
+						denial.into_response(StatusCode::INTERNAL_SERVER_ERROR),
+					))
+				},
+			},
+		}
+	} else {
+		let denial = RequestDenial::new(
+			DenialFault::User,
+			"Image not found".to_string(),
+			String::new(),
+		);
+
+		Ok(Box::new(denial.into_response(StatusCode::NOT_FOUND)))
+	}
 }

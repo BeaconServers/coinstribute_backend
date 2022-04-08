@@ -255,6 +255,11 @@ fn main() {
 		.and(software_ownership_db_filter.clone())
 		.and_then(download_software);
 
+	let view_software_image = warp::path!("view_software_image" / String)
+		.and(warp::addr::remote())
+		.and(log_filter)
+		.and_then(view_software_image);
+
 	let create_captcha = warp::path("create_captcha")
 		.and(captcha_db_filter.clone())
 		.map(create_captcha);
@@ -275,7 +280,7 @@ fn main() {
 			.or(search_software),
 	);
 
-	let get_routes = warp::get().and(create_captcha.or(view_captcha));
+	let get_routes = warp::get().and(create_captcha.or(view_captcha).or(view_software_image));
 
 	tokio_rt.spawn(async move {
 		let wallet = wallet();
