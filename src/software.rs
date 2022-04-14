@@ -26,6 +26,7 @@ use crate::db::{
 	CaptchaDB,
 	CookieDB,
 	DownloadCountDB,
+	MoneyDB,
 	SoftwareDB,
 	SoftwareOwnershipDB,
 	UploadIdDB,
@@ -71,7 +72,7 @@ pub struct NewSoftwareResp {
 pub fn new_software(
 	new_software_req: CreateSoftwareReq, auth_db: AuthDB, cookie_db: CookieDB,
 	software_db: SoftwareDB, upload_id_db: UploadIdDB, captcha_db: CaptchaDB,
-	current_soft_id: Arc<AtomicU64>,
+	current_soft_id: Arc<AtomicU64>, money_db: MoneyDB,
 ) -> Response<String> {
 	let bad_captcha = || -> Response<String> {
 		let denial = RequestDenial::new(
@@ -118,6 +119,22 @@ pub fn new_software(
 		);
 		return denial.into_response(StatusCode::UNAUTHORIZED);
 	}
+
+	// Make sure the user has at least 4271880000 piconero ($1 at the time of writing)
+	let mut financial_info = money_db.get(&new_software_req.username).unwrap().unwrap();
+	if let Err(balance) = financial_info.spend_money(4271880000) {
+		let denial = RequestDenial::new(
+			DenialFault::User,
+			format!("Balance is too low"),
+			balance.to_string(),
+		);
+
+		return denial.into_response(StatusCode::PRECONDITION_FAILED);
+	}
+
+	money_db
+		.insert(&new_software_req.username, &financial_info)
+		.unwrap();
 
 	// While obviously modified clients can just lie about how large the game's size is, there are strict checks when actually uploading the game to ensure that the file is the exact size specified
 	if new_software_req.compressed_size > 10_485_760

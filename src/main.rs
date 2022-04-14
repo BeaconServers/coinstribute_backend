@@ -231,6 +231,7 @@ fn main() {
 		.and(upload_id_db_filter.clone())
 		.and(captcha_db_filter.clone())
 		.and(current_software_id_filter.clone())
+		.and(money_db_filter.clone())
 		.map(new_software);
 
 	let upload_software = warp::path("upload_software")

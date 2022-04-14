@@ -18,16 +18,7 @@ use crate::logging::{Event, Log, LogType, Priority};
 use crate::money::FinancialInfo;
 use crate::{wallet, DenialFault, RequestDenial};
 
-const RESERVED_USERNAMES: [&str; 8] = [
-	"admin",
-	"root",
-	"sudo",
-	"bootlegbilly",
-	"susorodni",
-	"billyb2",
-	"billyb",
-	"billy",
-];
+const RESERVED_USERNAMES: [&str; 4] = ["admin", "root", "0xd34db33f", "d34db33f"];
 
 const MIN_USER_LEN: usize = 4;
 const MAX_USER_LEN: usize = 50;
@@ -207,17 +198,7 @@ pub async fn register(
 				// Since both of these are relatively long tasks, there's no reason not to run them in parallel.
 				// Especially since create_account is async
 				let (create_acc_res, hashed_password) = tokio::join!(
-					{
-						let start_time = std::time::Instant::now();
-						let addr = wallet().create_address(&username);
-						println!(
-							"Time to create addr: {}",
-							std::time::Instant::now()
-								.duration_since(start_time)
-								.as_secs_f32()
-						);
-						addr
-					},
+					wallet().create_address(&username),
 					tokio::task::spawn_blocking(move || hash_password(password.as_bytes(), &salt))
 				);
 

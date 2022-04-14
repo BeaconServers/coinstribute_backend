@@ -32,13 +32,14 @@ pub(crate) struct AttachXMRAddress {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct FinancialInfo {
+pub struct FinancialInfo {
 	xmr_addr: Option<Address>,
 	deposit_addr: Address,
 	transfers: Transfers,
 	balance: u64,
 	pending_balance: u64,
 	service_fee_total: u64,
+	amount_spent: u64,
 }
 
 impl FinancialInfo {
@@ -49,6 +50,7 @@ impl FinancialInfo {
 			balance: 0,
 			pending_balance: 0,
 			service_fee_total: 0,
+			amount_spent: 0,
 			transfers: Transfers {
 				addr_index,
 				transfers_in: Vec::new(),
@@ -58,7 +60,7 @@ impl FinancialInfo {
 	}
 
 	/// Adds all the transfers in and transfers out together
-	fn get_balance(&self) -> u64 {
+	pub fn get_balance(&self) -> u64 {
 		// Using an algabraic proof that I calculated then simplified a ton, we know that service_fee is equal to:
 		//  (amt_sent + network_fee) / 49
 		// We know this because service_fee = (2 * orig_amt) / 100 and we know that t.amount = orig_amt - service_fee - net_fee
@@ -71,7 +73,21 @@ impl FinancialInfo {
 			.map(|t| (t.amount + t.fee) / 49)
 			.sum();
 
-		self.balance - (self.service_fee_total.max(transfer_out_service_fee_total))
+		self.balance -
+			(self.service_fee_total.max(transfer_out_service_fee_total)) -
+			self.amount_spent
+	}
+
+	pub fn spend_money(&mut self, amount_spent: u64) -> Result<u64, u64> {
+		let old_balance = self.get_balance();
+
+		match old_balance.checked_sub(amount_spent) {
+			Some(new_balance) => {
+				self.amount_spent += amount_spent;
+				Ok(new_balance)
+			},
+			None => Err(old_balance),
+		}
 	}
 }
 

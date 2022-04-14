@@ -65,12 +65,12 @@ impl WalletRPC {
 
 						continue;
 					},
-					false => Err(WalletRPCError::HyperError(err))?,
+					false => return Err(WalletRPCError::HyperError(err)),
 				},
 			};
 		}
 
-		Err(WalletRPCError::HyperError(last_error.unwrap()))?
+		return Err(WalletRPCError::HyperError(last_error.unwrap()));
 
 	}
 
@@ -133,7 +133,7 @@ impl WalletRPC {
 		req_body.push_str("}}");
 
         let mut response = self.request(&req_body).await?;
-        
+
         let result = response.get_mut("result").ok_or(WalletRPCError::MissingData("result"))?;
 
         let per_subaddress = result.get_mut("per_subaddress").ok_or(WalletRPCError::MissingData("per_subaddress"))?.as_array_mut().unwrap();
@@ -425,12 +425,17 @@ impl From<monero::util::address::Error> for WalletRPCError {
 fn addr_indices_to_string(addr_indices: &[u64]) -> String {
 	let mut addr_indices_string = String::from("[");
 
-	addr_indices.iter().for_each(|index| {
-        addr_indices_string.push_str(&index.to_string());
-        addr_indices_string.push(',');
-    });
+    if !addr_indices.is_empty() {
+        addr_indices_string.reserve_exact(addr_indices.len() * 2);
 
-    addr_indices_string.pop().unwrap();
+        addr_indices.iter().for_each(|index| {
+            addr_indices_string.push_str(&index.to_string());
+            addr_indices_string.push(',');
+        });
+
+        addr_indices_string.pop().unwrap();
+    }
+
 	addr_indices_string.push(']');
 
 	addr_indices_string
